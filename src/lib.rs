@@ -146,24 +146,43 @@ impl Map for UncompressedMap5 {
     }
 }
 
+// read_hunk needs both Chd.io and Chd.cache mutable in Chd::read().
+// to satisfy borrow checker have to move it into free function
+fn read_hunk<T: R>(
+    io: &mut T,
+    map: &dyn Map,
+    hunknum: usize,
+    hunksize: usize,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    assert_eq!(buf.len(), hunksize);
+    let offset = map.locate(hunknum);
+    io.read_at(offset, buf)
+}
+
 pub struct Chd<T: R> {
     header: Header,
     filesize: u64,
     pos: i64,
     io: T,
     map: Box<dyn Map>,
+    cache: Vec<u8>,   // cached data for reads not aligned to hunk boundaries
+    cachehunk: usize, // cached hunk index
 }
 
 impl<T: R> Chd<T> {
     pub fn open(mut io: T) -> io::Result<Chd<T>> {
         let (header, map) = Header::read(&mut io)?;
         let filesize = io.seek(SeekFrom::End(0))?;
+        let hunksize = header.hunkbytes as usize;
         let chd = Chd {
             header,
             filesize,
             pos: 0,
             io,
             map,
+            cache: vec![0; hunksize],
+            cachehunk: usize::MAX, // definitely out of any hunk index value
         };
         Ok(chd)
     }
@@ -250,9 +269,8 @@ impl<T: R> Chd<T> {
     }
 
     fn read_hunk(&mut self, hunknum: usize, buf: &mut [u8]) -> io::Result<()> {
-        assert_eq!(buf.len(), self.hunk_size());
-        let offset = self.map.locate(hunknum);
-        self.io.read_at(offset, buf)
+        let hunksize = self.hunk_size();
+        read_hunk(&mut self.io, &*self.map, hunknum, hunksize, buf)
     }
 }
 
@@ -297,6 +315,61 @@ impl<T: R> Seek for Chd<T> {
     }
 }
 
+impl<T: R> Read for Chd<T> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let hasbytes = self.header.size - self.pos as u64;
+        if hasbytes == 0 {
+            return Ok(0);
+        }
+
+        let mut dest = buf;
+        if hasbytes < dest.len() as u64 {
+            dest = dest.split_at_mut(hasbytes as usize).0;
+        }
+        let lastbyte = self.pos + dest.len() as i64 - 1;
+        let hunkbytes = self.header.hunkbytes as usize;
+        let hunkbytes64 = hunkbytes as i64;
+        let hunklast = hunkbytes - 1;
+
+        let first_hunk = (self.pos / hunkbytes64) as usize;
+        let last_hunk = (lastbyte / hunkbytes64) as usize;
+        let result = dest.len();
+
+        // iterate over hunks
+        for curhunk in first_hunk..=last_hunk {
+            // determine start/end boundaries
+            let startoffs = match curhunk == first_hunk {
+                true => (self.pos % hunkbytes64) as usize,
+                false => 0,
+            };
+            let endoffs = match curhunk == last_hunk {
+                true => (lastbyte % hunkbytes64) as usize,
+                false => hunklast as usize,
+            };
+            let length = endoffs + 1 - startoffs;
+            let (mut head, tail) = dest.split_at_mut(length);
+            dest = tail;
+
+            if startoffs == 0 && endoffs == hunklast && curhunk != self.cachehunk {
+                // if it's a full hunk, just read directly from disk unless it's the cached hunk
+                self.read_hunk(curhunk, head)?;
+            } else {
+                // otherwise, read from the cache
+                let hunksize = self.hunk_size();
+                let cache = &mut self.cache;
+                if curhunk != self.cachehunk {
+                    // self.read_hunk(curhunk, cache)?; // error[E0499]: cannot borrow `*self` as mutable more than once at a time
+                    read_hunk(&mut self.io, &mut *self.map, curhunk, hunksize, cache)?;
+                    self.cachehunk = curhunk;
+                }
+                head.write(&cache[startoffs..startoffs + length])?;
+            }
+        }
+        self.pos += result as i64;
+        Ok(result)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,5 +409,27 @@ mod tests {
         assert!(chd.seek(SeekFrom::Current(1)).is_err());
         assert_eq!(chd.seek(SeekFrom::Current(-1)).unwrap(), last_byte);
         assert!(chd.seek(SeekFrom::Current(0 - chd.size() as i64)).is_err());
+
+        // read
+        let hunksize = chd.hunk_size();
+        let fixtures = [
+            (1, 1),
+            (0, hunksize),
+            (0, hunksize - 1),
+            (0, 1),
+            (1, hunksize - 2),
+            (hunksize - 1, 2),
+            (hunksize - 1, hunksize + 2),
+            (0, chd.size() as usize),
+        ];
+        for (offset, length) in fixtures.iter() {
+            let end = *offset + *length;
+            let original = &image[*offset..end];
+            let mut sample = vec![0; *length];
+            chd.read_at(*offset as u64, &mut sample).unwrap();
+            assert_eq!(sample, original);
+            // check read updates pos
+            assert_eq!(chd.seek(SeekFrom::Current(0)).unwrap(), end as u64);
+        }
     }
 }
