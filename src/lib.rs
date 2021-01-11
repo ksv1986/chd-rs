@@ -11,6 +11,14 @@ impl<T: Read + Seek> R for T {}
 
 const V5: u32 = 5;
 
+// Different drive versions have different map format
+trait Map {
+    // Return hunk offset in file
+    fn locate(&self, hunknum: usize) -> u64;
+}
+
+type MapType = Box<dyn Map>;
+
 #[derive(Default)]
 struct Header {
     // V5 fields
@@ -31,7 +39,7 @@ struct Header {
 }
 
 impl Header {
-    fn read<T: R>(io: &mut T) -> io::Result<Self> {
+    fn read<T: R>(io: &mut T) -> io::Result<(Self, MapType)> {
         let mut data = [0u8; 124];
         io.read_at(0, &mut data)?;
 
@@ -46,7 +54,11 @@ impl Header {
         match header.version {
             V5 => {
                 header.read_header_v5(&data)?;
-                Ok(header)
+                let map = match header.compressors[0] {
+                    0 => UncompressedMap5::read(io, &header),
+                    _ => Err(invalid_data_str("hdrv5: compressed map is not implemented")),
+                }?;
+                Ok((header, map))
             }
             x => Err(invalid_data(format!("chd: unsupported version {}", x))),
         }
@@ -100,20 +112,56 @@ impl Header {
     }
 }
 
+struct UncompressedMap5 {
+    hunkbytes: u64,
+    map: Vec<u8>, // uncompressed hunk map
+}
+
+impl UncompressedMap5 {
+    const fn offset(hunknum: usize) -> usize {
+        /*
+        V5 uncompressed map format:
+
+        [  0] uint32_t offset;        // starting offset / hunk size
+        */
+        4 * hunknum
+    }
+
+    fn read<T: R>(io: &mut T, header: &Header) -> io::Result<MapType> {
+        let hunkcount = header.hunkcount as usize;
+        let mut map = vec![0; Self::offset(hunkcount)];
+        io.read_at(header.mapoffset, &mut map)?;
+        Ok(Box::new(Self {
+            hunkbytes: header.hunkbytes as u64,
+            map,
+        }))
+    }
+}
+
+impl Map for UncompressedMap5 {
+    fn locate(&self, hunknum: usize) -> u64 {
+        let offs = Self::offset(hunknum);
+        let offset = read_be32(&self.map[offs..offs + 4]) as u64;
+        offset * self.hunkbytes
+    }
+}
+
 pub struct Chd<T: R> {
     header: Header,
     filesize: u64,
     io: T,
+    map: Box<dyn Map>,
 }
 
 impl<T: R> Chd<T> {
     pub fn open(mut io: T) -> io::Result<Chd<T>> {
-        let header = Header::read(&mut io)?;
+        let (header, map) = Header::read(&mut io)?;
         let filesize = io.seek(SeekFrom::End(0))?;
         let chd = Chd {
             header,
             filesize,
             io,
+            map,
         };
         Ok(chd)
     }
@@ -130,7 +178,11 @@ impl<T: R> Chd<T> {
         self.header.size
     }
 
-    pub fn hunk_size(&self) -> u32 {
+    pub fn hunk_size(&self) -> usize {
+        self.header.hunkbytes as usize
+    }
+
+    pub fn hunk_size_u32(&self) -> u32 {
         self.header.hunkbytes
     }
 
@@ -138,7 +190,11 @@ impl<T: R> Chd<T> {
         self.header.hunkcount
     }
 
-    pub fn unit_size(&self) -> u32 {
+    pub fn unit_size(&self) -> usize {
+        self.header.unitbytes as usize
+    }
+
+    pub fn unit_size_u32(&self) -> u32 {
         self.header.unitbytes
     }
 
@@ -190,6 +246,12 @@ impl<T: R> Chd<T> {
         }
         Ok(())
     }
+
+    fn read_hunk(&mut self, hunknum: usize, buf: &mut [u8]) -> io::Result<()> {
+        assert_eq!(buf.len(), self.hunk_size());
+        let offset = self.map.locate(hunknum);
+        self.io.read_at(offset, buf)
+    }
 }
 
 #[cfg(test)]
@@ -206,13 +268,19 @@ mod tests {
     #[test]
     fn test_basic() {
         /*
-        chdman createraw -c none -i data.b64 -o none.chd -hs 4096 -us 512
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o none.chd -c none
         */
         let raw = include_bytes!("../samples/none.chd");
         let file = Cursor::new(raw);
-        let chd = Chd::open(file).unwrap();
+        let mut chd = Chd::open(file).unwrap();
         assert_eq!(chd.version(), V5);
         assert_eq!(chd.file_size(), raw.len() as u64);
         assert_eq!(chd.size(), DATA_SIZE as u64);
+
+        // read hunk
+        let mut buf = vec![0; chd.hunk_size()];
+        chd.read_hunk(0, &mut buf).unwrap();
+        let image = include_bytes!("../samples/data.b64");
+        assert_eq!(buf, image[0..chd.hunk_size()]);
     }
 }

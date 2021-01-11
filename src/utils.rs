@@ -63,8 +63,8 @@ pub fn copy_from(mut to: &mut [u8], from: &[u8]) -> usize {
 }
 
 pub fn hex_write<W: Write>(to: &mut W, hash: &[u8]) -> io::Result<()> {
-    for i in hash.iter() {
-        write!(to, "{:02x}", *i)?;
+    for i in hash {
+        write!(to, "{:02x}", i)?;
     }
     Ok(())
 }
