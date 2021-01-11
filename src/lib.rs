@@ -149,6 +149,7 @@ impl Map for UncompressedMap5 {
 pub struct Chd<T: R> {
     header: Header,
     filesize: u64,
+    pos: i64,
     io: T,
     map: Box<dyn Map>,
 }
@@ -160,6 +161,7 @@ impl<T: R> Chd<T> {
         let chd = Chd {
             header,
             filesize,
+            pos: 0,
             io,
             map,
         };
@@ -254,6 +256,47 @@ impl<T: R> Chd<T> {
     }
 }
 
+impl<T: R> Seek for Chd<T> {
+    fn seek(&mut self, sf: SeekFrom) -> io::Result<u64> {
+        let size = self.header.size as i64;
+        let newpos = match sf {
+            SeekFrom::Start(x) => x as i64,
+            SeekFrom::Current(x) => {
+                if let Some(xx) = self.pos.checked_add(x) {
+                    xx as i64
+                } else {
+                    return Err(invalid_data(format!(
+                        "chd: overflowing seek {}{:+}, logical size {}",
+                        self.pos,
+                        x,
+                        self.size()
+                    )));
+                }
+            }
+            SeekFrom::End(x) => {
+                if let Some(xx) = size.checked_add(x) {
+                    xx
+                } else {
+                    return Err(invalid_data(format!(
+                        "chd: overflowing seek {} from logical end {}",
+                        x,
+                        self.size()
+                    )));
+                }
+            }
+        };
+        if newpos < 0 || newpos > size {
+            return Err(invalid_data(format!(
+                "chd: invalid seek to {} out of logical size {}",
+                newpos,
+                self.size()
+            )));
+        }
+        self.pos = newpos;
+        Ok(self.pos as u64)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +325,16 @@ mod tests {
         chd.read_hunk(0, &mut buf).unwrap();
         let image = include_bytes!("../samples/data.b64");
         assert_eq!(buf, image[0..chd.hunk_size()]);
+
+        // seek
+        let last_byte = chd.size() - 1;
+        assert_eq!(chd.seek(SeekFrom::Start(0)).unwrap(), 0);
+        assert!(chd.seek(SeekFrom::Current(-1)).is_err());
+        assert_eq!(chd.seek(SeekFrom::Current(0)).unwrap(), 0);
+        assert_eq!(chd.seek(SeekFrom::Start(1)).unwrap(), 1);
+        assert_eq!(chd.seek(SeekFrom::End(0)).unwrap(), chd.size());
+        assert!(chd.seek(SeekFrom::Current(1)).is_err());
+        assert_eq!(chd.seek(SeekFrom::Current(-1)).unwrap(), last_byte);
+        assert!(chd.seek(SeekFrom::Current(0 - chd.size() as i64)).is_err());
     }
 }
