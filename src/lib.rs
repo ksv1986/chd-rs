@@ -3,7 +3,7 @@ use utils::*;
 
 use std::convert::TryFrom;
 use std::io;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 // Define constraints for underlaying Chd file I/O
 pub trait R: Read + Seek {}
@@ -140,6 +140,55 @@ impl<T: R> Chd<T> {
 
     pub fn unit_size(&self) -> u32 {
         self.header.unitbytes
+    }
+
+    pub fn write_summary<W: Write>(&self, to: &mut W) -> io::Result<()> {
+        writeln!(to, "File size: {}", self.file_size())?;
+        writeln!(to, "CHD version: {}", self.version())?;
+        writeln!(to, "Logical size: {}", self.size())?;
+        writeln!(to, "Hunk Size: {}", self.hunk_size())?;
+        writeln!(to, "Total Hunks: {}", self.hunk_count())?;
+        writeln!(to, "Unit Size: {}", self.unit_size())?;
+        write!(to, "Compression:")?;
+        for i in 0..4 {
+            match self.header.compressors[i] {
+                0 => {
+                    if i == 0 {
+                        print!(" none");
+                    }
+                    break;
+                }
+                other => {
+                    let mut s = String::with_capacity(5);
+                    let mut v = other;
+                    for _ in 0..4 {
+                        let c = std::char::from_u32(v >> 24);
+                        if c.is_some() && c.unwrap().is_ascii() {
+                            s.push(c.unwrap());
+                        } else {
+                            s.push('?');
+                        }
+                        v <<= 8;
+                    }
+                    write!(to, " {} ({:08x})", s, other)?;
+                }
+            }
+        }
+        writeln!(to, "")?;
+        let ratio = 1e2 * (self.file_size() as f32) / (self.size() as f32);
+        writeln!(to, "Ratio: {:.1}%", ratio)?;
+        write!(to, "SHA1: ")?;
+        hex_writeln(to, &self.header.sha1)?;
+        write!(to, "Data SHA1: ")?;
+        hex_writeln(to, &self.header.rawsha1)?;
+        for i in self.header.parentsha1.iter() {
+            if *i > 0 {
+                write!(to, "Parent SHA1: ")?;
+                hex_writeln(to, &self.header.parentsha1)?;
+                break;
+            }
+        }
+        Ok(())
     }
 }
 

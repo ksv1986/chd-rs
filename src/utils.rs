@@ -61,3 +61,16 @@ pub fn invalid_data(msg: String) -> io::Error {
 pub fn copy_from(mut to: &mut [u8], from: &[u8]) -> usize {
     to.write(from).unwrap()
 }
+
+pub fn hex_write<W: Write>(to: &mut W, hash: &[u8]) -> io::Result<()> {
+    for i in hash.iter() {
+        write!(to, "{:02x}", *i)?;
+    }
+    Ok(())
+}
+
+pub fn hex_writeln<W: Write>(to: &mut W, hash: &[u8]) -> io::Result<()> {
+    hex_write(to, hash)?;
+    writeln!(to, "")?;
+    Ok(())
+}
