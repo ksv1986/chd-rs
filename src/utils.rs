@@ -1,3 +1,5 @@
+extern crate crc16;
+
 use super::R;
 use std::io;
 use std::io::{SeekFrom, Write};
@@ -39,6 +41,26 @@ pub fn read_be64(data: &[u8]) -> u64 {
         | data[7] as u64
 }
 
+pub fn write_be16(data: &mut [u8], val: u16) {
+    data[1] = val as u8;
+    data[0] = (val >> 8) as u8;
+}
+
+pub fn write_be24(data: &mut [u8], val: u32) {
+    data[2] = val as u8;
+    data[1] = (val >> 8) as u8;
+    data[0] = (val >> 16) as u8;
+}
+
+pub fn write_be48(data: &mut [u8], val: u64) {
+    data[5] = val as u8;
+    data[4] = (val >> 8) as u8;
+    data[3] = (val >> 16) as u8;
+    data[2] = (val >> 24) as u8;
+    data[1] = (val >> 32) as u8;
+    data[0] = (val >> 40) as u8;
+}
+
 pub trait ReadAt {
     fn read_at(&mut self, offset: u64, data: &mut [u8]) -> io::Result<()>;
 }
@@ -73,4 +95,8 @@ pub fn hex_writeln<W: Write>(to: &mut W, hash: &[u8]) -> io::Result<()> {
     hex_write(to, hash)?;
     writeln!(to, "")?;
     Ok(())
+}
+
+pub fn crc16(data: &[u8]) -> u16 {
+    crc16::State::<crc16::CCITT_FALSE>::calculate(data)
 }

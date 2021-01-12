@@ -10,3 +10,4 @@ A library for CHD file parsing functionality
 readme = "README.md"
 
 [dependencies]
+crc16 = "0.4"

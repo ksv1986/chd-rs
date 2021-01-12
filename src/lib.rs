@@ -1,4 +1,8 @@
+mod bitstream;
+mod huffman;
 pub mod utils;
+use bitstream::BitReader;
+use huffman::Huffman;
 use utils::*;
 
 use std::convert::TryFrom;
@@ -10,6 +14,38 @@ pub trait R: Read + Seek {}
 impl<T: Read + Seek> R for T {}
 
 const V5: u32 = 5;
+
+/* codec #0
+ * these types are live when running */
+const COMPRESSION_TYPE_0: u8 = 0;
+/* codec #1 */
+const COMPRESSION_TYPE_1: u8 = 1;
+/* codec #2 */
+const COMPRESSION_TYPE_2: u8 = 2;
+/* codec #3 */
+const COMPRESSION_TYPE_3: u8 = 3;
+/* no compression; implicit length = hunkbytes */
+const COMPRESSION_NONE: u8 = 4;
+/* same as another block in this chd */
+const COMPRESSION_SELF: u8 = 5;
+/* same as a hunk's worth of units in the parent chd */
+const COMPRESSION_PARENT: u8 = 6;
+
+/* start of small RLE run (4-bit length)
+ * these additional pseudo-types are used for compressed encodings: */
+const COMPRESSION_RLE_SMALL: u8 = 7;
+/* start of large RLE run (8-bit length) */
+const COMPRESSION_RLE_LARGE: u8 = 8;
+/* same as the last COMPRESSION_SELF block */
+const COMPRESSION_SELF_0: u8 = 9;
+/* same as the last COMPRESSION_SELF block + 1 */
+const COMPRESSION_SELF_1: u8 = 10;
+/* same block in the parent */
+const COMPRESSION_PARENT_SELF: u8 = 11;
+/* same as the last COMPRESSION_PARENT block */
+const COMPRESSION_PARENT_0: u8 = 12;
+/* same as the last COMPRESSION_PARENT block + 1 */
+const COMPRESSION_PARENT_1: u8 = 13;
 
 // Different drive versions have different map format
 trait Map {
@@ -56,7 +92,7 @@ impl Header {
                 header.read_header_v5(&data)?;
                 let map = match header.compressors[0] {
                     0 => UncompressedMap5::read(io, &header),
-                    _ => Err(invalid_data_str("hdrv5: compressed map is not implemented")),
+                    _ => CompressedMap5::read(io, &header),
                 }?;
                 Ok((header, map))
             }
@@ -143,6 +179,161 @@ impl Map for UncompressedMap5 {
         let offs = Self::offset(hunknum);
         let offset = read_be32(&self.map[offs..offs + 4]) as u64;
         offset * self.hunkbytes
+    }
+}
+
+struct CompressedMap5 {
+    map: Vec<u8>, // uncompressed hunk map
+}
+
+impl CompressedMap5 {
+    const fn offset(hunknum: usize) -> usize {
+        /*
+        Each compressed map entry, once expanded, looks like:
+
+        [  0] uint8_t compression;    // compression type
+        [  1] UINT24 complength;      // compressed length
+        [  4] UINT48 offset;          // offset
+        [ 10] uint16_t crc;           // crc-16 of the data
+        */
+        12 * hunknum
+    }
+
+    fn read<T: R>(io: &mut T, header: &Header) -> io::Result<MapType> {
+        let mut maphdr = [0; 16];
+        io.read_at(header.mapoffset, &mut maphdr)?;
+
+        let maplength = read_be32(&maphdr[0..4]);
+        let mut comprmap = vec![0; maplength as usize];
+        io.read_exact(comprmap.as_mut_slice())?;
+
+        Ok(Box::new(Self::decompress(header, &maphdr, &comprmap)?))
+    }
+
+    fn decompress(header: &Header, maphdr: &[u8], comprmap: &[u8]) -> io::Result<Self> {
+        let hunkcount = header.hunkcount as usize;
+        let hunkbytes = header.hunkbytes;
+        let unitbytes = header.unitbytes;
+
+        let mut bits = BitReader::new(&comprmap);
+        let mut huffman = Huffman::new(16, 8);
+        huffman.import_tree_rle(&mut bits)?;
+
+        let mut map = vec![0; Self::offset(hunkcount)];
+
+        // first decode the compression types
+        let mut lastcomp = 0; // last known compression value
+        let mut repcount = 0; // number of value repeats
+        for hunknum in 0..hunkcount {
+            if repcount > 0 {
+                repcount -= 1;
+            } else {
+                match huffman.decode_one(&mut bits) as u8 {
+                    COMPRESSION_RLE_SMALL => {
+                        repcount = 2 + huffman.decode_one(&mut bits);
+                    }
+                    COMPRESSION_RLE_LARGE => {
+                        repcount = 2 + 16 + (huffman.decode_one(&mut bits) << 4);
+                        repcount += huffman.decode_one(&mut bits);
+                    }
+                    val => {
+                        lastcomp = val;
+                    }
+                }
+            }
+            map[Self::offset(hunknum)] = lastcomp;
+        }
+
+        // then iterate through the hunks and extract the needed data
+        let lengthbits = Self::bit_length(maphdr[12])?;
+        let hunkbits = Self::bit_length(maphdr[13])?;
+        let parentbits = Self::bit_length(maphdr[14])?;
+
+        let mut curoffset = read_be48(&maphdr[4..10]);
+        let mut lastself = 0;
+        let mut lastparent = 0;
+        for hunknum in 0..hunkcount {
+            let mut offset = curoffset;
+            let mut length = 0;
+            let mut crc = 0;
+            let mapentry = &mut map[Self::offset(hunknum)..Self::offset(hunknum + 1)];
+            let compression = &mut mapentry[0];
+            match *compression {
+                // base types
+                COMPRESSION_TYPE_0 | COMPRESSION_TYPE_1 | COMPRESSION_TYPE_2
+                | COMPRESSION_TYPE_3 => {
+                    length = bits.read(lengthbits);
+                    curoffset += length as u64;
+                    crc = bits.read(16) as u16;
+                }
+                COMPRESSION_NONE => {
+                    length = hunkbytes;
+                    curoffset += length as u64;
+                    crc = bits.read(16) as u16;
+                }
+                COMPRESSION_SELF => {
+                    offset = bits.read(hunkbits) as u64;
+                    lastself = offset;
+                }
+                COMPRESSION_PARENT => {
+                    offset = bits.read(parentbits as usize) as u64;
+                    lastparent = offset;
+                }
+                // pseudo-types; convert into base types
+                COMPRESSION_SELF_0 | COMPRESSION_SELF_1 => {
+                    lastself += (*compression - COMPRESSION_SELF_0) as u64;
+                    offset = lastself;
+                    *compression = COMPRESSION_SELF;
+                }
+                COMPRESSION_PARENT_SELF => {
+                    lastparent = ((hunknum as u64) * (hunkbytes as u64)) / (unitbytes as u64);
+                    offset = lastparent;
+                    *compression = COMPRESSION_PARENT;
+                }
+                COMPRESSION_PARENT_0 | COMPRESSION_PARENT_1 => {
+                    if *compression == COMPRESSION_PARENT_1 {
+                        lastparent += (hunkbytes / unitbytes) as u64;
+                    }
+                    offset = lastparent;
+                    *compression = COMPRESSION_PARENT;
+                }
+                x => {
+                    return Err(invalid_data(format!(
+                        "chdv5: unknown hunk#{} compression type {}",
+                        hunknum, x
+                    )))
+                }
+            }
+            write_be24(&mut mapentry[1..4], length);
+            write_be48(&mut mapentry[4..10], offset);
+            write_be16(&mut mapentry[10..12], crc);
+        }
+        let crc = read_be16(&maphdr[10..12]);
+        let calc = crc16(&map);
+        if calc != crc {
+            return Err(invalid_data(format!(
+                "chdv5: decompressed map crc {:04x} doesn't match header {:04x}",
+                calc, crc
+            )));
+        }
+        Ok(Self { map })
+    }
+
+    fn bit_length(val: u8) -> io::Result<usize> {
+        match val {
+            32..=u8::MAX => Err(invalid_data(format!(
+                "chdv5: bit length {} is too big",
+                val
+            ))),
+            val => Ok(val as usize),
+        }
+    }
+}
+
+impl Map for CompressedMap5 {
+    fn locate(&self, hunknum: usize) -> u64 {
+        let offset = Self::offset(hunknum);
+        read_be48(&self.map[offset + 4..offset + 10])
     }
 }
 
@@ -381,17 +572,21 @@ mod tests {
     */
     const DATA_SIZE: usize = 44267;
 
+    fn open_chd(raw: &[u8]) -> Chd<Cursor<&[u8]>> {
+        let file = Cursor::new(raw);
+        let chd = Chd::open(file).unwrap();
+        assert_eq!(chd.version(), V5);
+        assert_eq!(chd.file_size(), raw.len() as u64);
+        assert_eq!(chd.size(), DATA_SIZE as u64);
+        chd
+    }
+
     #[test]
     fn test_basic() {
         /*
         chdman createraw -hs 4096 -us 512 -i data.b64 -o none.chd -c none
         */
-        let raw = include_bytes!("../samples/none.chd");
-        let file = Cursor::new(raw);
-        let mut chd = Chd::open(file).unwrap();
-        assert_eq!(chd.version(), V5);
-        assert_eq!(chd.file_size(), raw.len() as u64);
-        assert_eq!(chd.size(), DATA_SIZE as u64);
+        let mut chd = open_chd(include_bytes!("../samples/none.chd"));
 
         // read hunk
         let mut buf = vec![0; chd.hunk_size()];
@@ -431,5 +626,13 @@ mod tests {
             // check read updates pos
             assert_eq!(chd.seek(SeekFrom::Current(0)).unwrap(), end as u64);
         }
+    }
+
+    #[test]
+    fn test_huffman() {
+        /*
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o huff.chd -c huff
+        */
+        open_chd(include_bytes!("../samples/huff.chd"));
     }
 }
