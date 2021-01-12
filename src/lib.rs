@@ -1,8 +1,12 @@
 mod bitstream;
+mod decompress;
 mod huffman;
+pub mod tags;
 pub mod utils;
 use bitstream::BitReader;
+use decompress::DecompressType;
 use huffman::Huffman;
+use tags::*;
 use utils::*;
 
 use std::convert::TryFrom;
@@ -357,6 +361,7 @@ pub struct Chd<T: R> {
     pos: i64,
     io: T,
     map: Box<dyn Map>,
+    decompress: [DecompressType; 4],
     cache: Vec<u8>,   // cached data for reads not aligned to hunk boundaries
     cachehunk: usize, // cached hunk index
 }
@@ -364,6 +369,7 @@ pub struct Chd<T: R> {
 impl<T: R> Chd<T> {
     pub fn open(mut io: T) -> io::Result<Chd<T>> {
         let (header, map) = Header::read(&mut io)?;
+        let decompress = decompress::init(&header);
         let filesize = io.seek(SeekFrom::End(0))?;
         let hunksize = header.hunkbytes as usize;
         let chd = Chd {
@@ -372,6 +378,7 @@ impl<T: R> Chd<T> {
             pos: 0,
             io,
             map,
+            decompress,
             cache: vec![0; hunksize],
             cachehunk: usize::MAX, // definitely out of any hunk index value
         };
@@ -426,19 +433,8 @@ impl<T: R> Chd<T> {
                     }
                     break;
                 }
-                other => {
-                    let mut s = String::with_capacity(5);
-                    let mut v = other;
-                    for _ in 0..4 {
-                        let c = std::char::from_u32(v >> 24);
-                        if c.is_some() && c.unwrap().is_ascii() {
-                            s.push(c.unwrap());
-                        } else {
-                            s.push('?');
-                        }
-                        v <<= 8;
-                    }
-                    write!(to, " {} ({:08x})", s, other)?;
+                tag => {
+                    write!(to, " {}", tag_string(tag))?;
                 }
             }
         }
