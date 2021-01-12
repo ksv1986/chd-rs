@@ -51,10 +51,14 @@ const COMPRESSION_PARENT_0: u8 = 12;
 /* same as the last COMPRESSION_PARENT block + 1 */
 const COMPRESSION_PARENT_1: u8 = 13;
 
+// Hunk compression, offset in file and length
+type MapHunk = (u8, u64, u32);
+
 // Different drive versions have different map format
 trait Map {
-    // Return hunk offset in file
-    fn locate(&self, hunknum: usize) -> u64;
+    fn locate(&self, hunknum: usize) -> MapHunk;
+    // Different versions use different digest algorithm
+    fn validate(&self, hunknum: usize, buf: &[u8]) -> io::Result<()>;
 }
 
 type MapType = Box<dyn Map>;
@@ -179,10 +183,20 @@ impl UncompressedMap5 {
 }
 
 impl Map for UncompressedMap5 {
-    fn locate(&self, hunknum: usize) -> u64 {
+    fn locate(&self, hunknum: usize) -> MapHunk {
         let offs = Self::offset(hunknum);
         let offset = read_be32(&self.map[offs..offs + 4]) as u64;
-        offset * self.hunkbytes
+        (
+            COMPRESSION_NONE,
+            offset * self.hunkbytes,
+            self.hunkbytes as u32,
+        )
+    }
+
+    fn validate(&self, _hunknum: usize, _buf: &[u8]) -> io::Result<()> {
+        Err(invalid_data_str(
+            "Uncompressed map has no checksum for hunk",
+        ))
     }
 }
 
@@ -335,9 +349,67 @@ impl CompressedMap5 {
 }
 
 impl Map for CompressedMap5 {
-    fn locate(&self, hunknum: usize) -> u64 {
-        let offset = Self::offset(hunknum);
-        read_be48(&self.map[offset + 4..offset + 10])
+    fn locate(&self, hunknum: usize) -> MapHunk {
+        let o = Self::offset(hunknum);
+        (
+            self.map[o],
+            read_be48(&self.map[o + 4..o + 10]),
+            read_be24(&self.map[o + 1..o + 4]),
+        )
+    }
+
+    fn validate(&self, hunknum: usize, buf: &[u8]) -> io::Result<()> {
+        let o = Self::offset(hunknum);
+        let crc = read_be16(&self.map[o + 10..o + 12]);
+        let calc = crc16(buf);
+        match calc == crc {
+            true => Ok(()),
+            false => Err(invalid_data(format!(
+                "hunk#{}: crc16 {:04x} doesn't match map {:04x}",
+                hunknum, calc, crc
+            ))),
+        }
+    }
+}
+
+fn decompress_hunk<T: R>(
+    io: &mut T,
+    maphunk: MapHunk,
+    dindex: usize,
+    decompress: &mut [DecompressType],
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let (compression, offset, length) = maphunk;
+    let d = decompress[dindex]
+        .as_deref_mut()
+        .ok_or(invalid_data(format!(
+            "hunk@{}: no decompressor #{} for {}",
+            offset, dindex, compression
+        )))?;
+    let mut compbuf = vec![0; length as usize];
+    io.read_at(offset, compbuf.as_mut_slice())?;
+    d.decompress(&compbuf, buf)
+}
+
+fn read_hunk_at<T: R>(
+    io: &mut T,
+    map: &dyn Map,
+    decompress: &mut [DecompressType],
+    maphunk: MapHunk,
+    hunksize: usize,
+    buf: &mut [u8],
+) -> io::Result<()> {
+    let (compression, offset, _) = maphunk;
+    match compression {
+        COMPRESSION_NONE => io.read_at(offset, buf),
+        COMPRESSION_TYPE_0 | COMPRESSION_TYPE_1 | COMPRESSION_TYPE_2 | COMPRESSION_TYPE_3 => {
+            let dindex = (compression - COMPRESSION_TYPE_0) as usize;
+            decompress_hunk(io, maphunk, dindex, decompress, buf)
+        }
+        x => Err(invalid_data(format!(
+            "hunk@{}: unsupported compression {}",
+            offset, x
+        ))),
     }
 }
 
@@ -346,13 +418,14 @@ impl Map for CompressedMap5 {
 fn read_hunk<T: R>(
     io: &mut T,
     map: &dyn Map,
+    decompress: &mut [DecompressType],
     hunknum: usize,
     hunksize: usize,
     buf: &mut [u8],
 ) -> io::Result<()> {
     assert_eq!(buf.len(), hunksize);
-    let offset = map.locate(hunknum);
-    io.read_at(offset, buf)
+    let maphunk = map.locate(hunknum);
+    read_hunk_at(io, map, decompress, maphunk, hunksize, buf)
 }
 
 pub struct Chd<T: R> {
@@ -405,7 +478,11 @@ impl<T: R> Chd<T> {
         self.header.hunkbytes
     }
 
-    pub fn hunk_count(&self) -> u32 {
+    pub fn hunk_count(&self) -> usize {
+        self.header.hunkcount as usize
+    }
+
+    pub fn hunk_count_u32(&self) -> u32 {
         self.header.hunkcount
     }
 
@@ -455,9 +532,39 @@ impl<T: R> Chd<T> {
         Ok(())
     }
 
+    pub fn validate_hunk(&mut self, hunknum: usize) -> io::Result<()> {
+        if hunknum >= self.hunk_count() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid hunk#{}: chd has {} hunks",
+                    hunknum,
+                    self.hunk_count()
+                ),
+            ));
+        }
+        let mut buf = vec![0; self.hunk_size()];
+        self.read_hunk(hunknum, &mut buf)?;
+        self.map.validate(hunknum, &buf)
+    }
+
+    pub fn validate(&mut self) -> io::Result<()> {
+        for i in 0..self.hunk_count() {
+            self.validate_hunk(i)?;
+        }
+        Ok(())
+    }
+
     fn read_hunk(&mut self, hunknum: usize, buf: &mut [u8]) -> io::Result<()> {
         let hunksize = self.hunk_size();
-        read_hunk(&mut self.io, &*self.map, hunknum, hunksize, buf)
+        read_hunk(
+            &mut self.io,
+            &*self.map,
+            &mut self.decompress,
+            hunknum,
+            hunksize,
+            buf,
+        )
     }
 }
 
@@ -546,7 +653,14 @@ impl<T: R> Read for Chd<T> {
                 let cache = &mut self.cache;
                 if curhunk != self.cachehunk {
                     // self.read_hunk(curhunk, cache)?; // error[E0499]: cannot borrow `*self` as mutable more than once at a time
-                    read_hunk(&mut self.io, &mut *self.map, curhunk, hunksize, cache)?;
+                    read_hunk(
+                        &mut self.io,
+                        &mut *self.map,
+                        &mut self.decompress,
+                        curhunk,
+                        hunksize,
+                        cache,
+                    )?;
                     self.cachehunk = curhunk;
                 }
                 head.write(&cache[startoffs..startoffs + length])?;
@@ -567,6 +681,7 @@ mod tests {
     du -b samples/data.b64
     */
     const DATA_SIZE: usize = 44267;
+    const IMAGE: &[u8] = include_bytes!("../samples/data.b64");
 
     fn open_chd(raw: &[u8]) -> Chd<Cursor<&[u8]>> {
         let file = Cursor::new(raw);
@@ -587,7 +702,7 @@ mod tests {
         // read hunk
         let mut buf = vec![0; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
-        let image = include_bytes!("../samples/data.b64");
+        let image = IMAGE;
         assert_eq!(buf, image[0..chd.hunk_size()]);
 
         // seek
@@ -629,6 +744,11 @@ mod tests {
         /*
         chdman createraw -hs 4096 -us 512 -i data.b64 -o huff.chd -c huff
         */
-        open_chd(include_bytes!("../samples/huff.chd"));
+        let mut chd = open_chd(include_bytes!("../samples/huff.chd"));
+        // read hunk
+        let mut buf = vec![0; chd.hunk_size()];
+        chd.read_hunk(0, &mut buf).unwrap();
+
+        chd.validate().unwrap();
     }
 }
