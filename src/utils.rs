@@ -42,6 +42,11 @@ pub fn read_be64(data: &[u8]) -> u64 {
         | data[7] as u64
 }
 
+pub fn write_le16(data: &mut [u8], val: u16) {
+    data[0] = val as u8;
+    data[1] = (val >> 8) as u8;
+}
+
 pub fn write_be16(data: &mut [u8], val: u16) {
     data[1] = val as u8;
     data[0] = (val >> 8) as u8;

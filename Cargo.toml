@@ -11,6 +11,7 @@ readme = "README.md"
 build = "build.rs"
 
 [dependencies]
+claxon = "0.4"
 crc16 = "0.4"
 inflate = "0.4"
 

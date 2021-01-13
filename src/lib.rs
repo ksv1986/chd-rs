@@ -808,6 +808,14 @@ mod tests {
     }
 
     #[test]
+    fn test_flac() {
+        /*
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o flac.chd -c flac
+        */
+        test_compressed_chd(include_bytes!("../samples/flac.chd"))
+    }
+
+    #[test]
     fn test_lzma() {
         /*
         chdman createraw -hs 4096 -us 512 -i data.b64 -o lzma.chd -c lzma
