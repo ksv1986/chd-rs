@@ -391,10 +391,18 @@ fn decompress_hunk<T: R>(
     d.decompress(&compbuf, buf)
 }
 
+fn deref_parent<T: R>(parent: &mut ParentType<T>, offset: u64) -> io::Result<&mut Chd<T>> {
+    parent.as_deref_mut().ok_or(invalid_data(format!(
+        "hunk@{}: requires parent chd",
+        offset
+    )))
+}
+
 fn read_hunk_at<T: R>(
     io: &mut T,
     map: &dyn Map,
     decompress: &mut [DecompressType],
+    parent: &mut ParentType<T>,
     maphunk: MapHunk,
     hunksize: usize,
     buf: &mut [u8],
@@ -402,7 +410,15 @@ fn read_hunk_at<T: R>(
     let (compression, offset, _) = maphunk;
     match compression {
         COMPRESSION_NONE => io.read_at(offset, buf),
-        COMPRESSION_SELF => read_hunk(io, map, decompress, offset as usize, hunksize, buf),
+        COMPRESSION_SELF => read_hunk(io, map, decompress, parent, offset as usize, hunksize, buf),
+        COMPRESSION_PARENT => {
+            let parent_chd = deref_parent(parent, offset)?;
+            let parent_offs = offset * parent_chd.unit_size_u64();
+            // partial read is OK, last hunk in parent could be shorter than hunksize
+            parent_chd.seek(SeekFrom::Start(parent_offs))?;
+            parent_chd.read(buf)?;
+            Ok(())
+        }
         COMPRESSION_TYPE_0 | COMPRESSION_TYPE_1 | COMPRESSION_TYPE_2 | COMPRESSION_TYPE_3 => {
             let dindex = (compression - COMPRESSION_TYPE_0) as usize;
             decompress_hunk(io, maphunk, dindex, decompress, buf)
@@ -420,14 +436,17 @@ fn read_hunk<T: R>(
     io: &mut T,
     map: &dyn Map,
     decompress: &mut [DecompressType],
+    parent: &mut ParentType<T>,
     hunknum: usize,
     hunksize: usize,
     buf: &mut [u8],
 ) -> io::Result<()> {
     assert_eq!(buf.len(), hunksize);
     let maphunk = map.locate(hunknum);
-    read_hunk_at(io, map, decompress, maphunk, hunksize, buf)
+    read_hunk_at(io, map, decompress, parent, maphunk, hunksize, buf)
 }
+
+type ParentType<T> = Option<Box<Chd<T>>>;
 
 pub struct Chd<T: R> {
     header: Header,
@@ -438,6 +457,7 @@ pub struct Chd<T: R> {
     decompress: [DecompressType; 4],
     cache: Vec<u8>,   // cached data for reads not aligned to hunk boundaries
     cachehunk: usize, // cached hunk index
+    parent: ParentType<T>,
 }
 
 impl<T: R> Chd<T> {
@@ -455,8 +475,21 @@ impl<T: R> Chd<T> {
             decompress,
             cache: vec![0; hunksize],
             cachehunk: usize::MAX, // definitely out of any hunk index value
+            parent: None,
         };
         Ok(chd)
+    }
+
+    pub fn set_parent(&mut self, parent: Chd<T>) -> io::Result<()> {
+        if parent.header.sha1 != self.header.parentsha1 {
+            return Err(invalid_data(format!(
+                "wrong parent sha1 {}: need {}",
+                hex_string(&parent.header.sha1),
+                hex_string(&self.header.parentsha1)
+            )));
+        }
+        self.parent = Some(Box::new(parent));
+        Ok(())
     }
 
     pub fn file_size(&self) -> u64 {
@@ -493,6 +526,10 @@ impl<T: R> Chd<T> {
 
     pub fn unit_size_u32(&self) -> u32 {
         self.header.unitbytes
+    }
+
+    pub fn unit_size_u64(&self) -> u64 {
+        self.header.unitbytes as u64
     }
 
     pub fn write_summary<W: Write>(&self, to: &mut W) -> io::Result<()> {
@@ -545,12 +582,18 @@ impl<T: R> Chd<T> {
             ));
         }
         let maphunk = self.map.locate(hunknum);
-        if maphunk.0 == COMPRESSION_SELF {
-            return self.validate_hunk(maphunk.1 as usize);
+        match maphunk.0 {
+            COMPRESSION_SELF => self.validate_hunk(maphunk.1 as usize),
+            COMPRESSION_PARENT => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("hunk#{}: parent chd hunks has no checksum", hunknum),
+            )),
+            _ => {
+                let mut buf = vec![0; self.hunk_size()];
+                self.read_hunk(hunknum, &mut buf)?;
+                self.map.validate(hunknum, &buf)
+            }
         }
-        let mut buf = vec![0; self.hunk_size()];
-        self.read_hunk(hunknum, &mut buf)?;
-        self.map.validate(hunknum, &buf)
     }
 
     pub fn validate(&mut self) -> io::Result<()> {
@@ -566,6 +609,7 @@ impl<T: R> Chd<T> {
             &mut self.io,
             &*self.map,
             &mut self.decompress,
+            &mut self.parent,
             hunknum,
             hunksize,
             buf,
@@ -662,6 +706,7 @@ impl<T: R> Read for Chd<T> {
                         &mut self.io,
                         &mut *self.map,
                         &mut self.decompress,
+                        &mut self.parent,
                         curhunk,
                         hunksize,
                         cache,
@@ -767,5 +812,30 @@ mod tests {
         let mut buf = vec![1; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
         chd.validate().unwrap();
+    }
+
+    #[test]
+    fn test_child() {
+        /* changes some hunks in source data otherwise we will have the same sha1 hash in parent and child
+        cp data.b64 child.b64
+        dd if=a.bin of=child.b64 bs=4096 count=4 seek=3 conv=notrunc
+        chdman createraw -hs 4096 -us 512 -i child.b64 -o child.chd -op huff.chd -c huff
+        */
+        let mut chd = open_chd(include_bytes!("../samples/child.chd"));
+        let mut buf = vec![1; chd.hunk_size()];
+        assert!(chd.read_hunk(0, &mut buf).is_err());
+
+        let wrong = open_chd(include_bytes!("../samples/self.chd"));
+        assert!(chd.set_parent(wrong).is_err());
+
+        let parent = open_chd(include_bytes!("../samples/huff.chd"));
+        chd.set_parent(parent).unwrap();
+        chd.read_hunk(0, &mut buf).unwrap();
+        // can't validate() parent hunks, read chd instead
+        assert!(chd.validate().is_err());
+        let image = include_bytes!("../samples/child.b64");
+        let mut sample = vec![0; image.len()];
+        chd.read_at(0, &mut sample).unwrap();
+        assert_eq!(sample, image);
     }
 }

@@ -1,6 +1,7 @@
 extern crate crc16;
 
 use super::R;
+use std::fmt::Write as FmtWrite;
 use std::io;
 use std::io::{SeekFrom, Write};
 
@@ -95,6 +96,14 @@ pub fn hex_writeln<W: Write>(to: &mut W, hash: &[u8]) -> io::Result<()> {
     hex_write(to, hash)?;
     writeln!(to, "")?;
     Ok(())
+}
+
+pub fn hex_string(hash: &[u8]) -> String {
+    let mut s = String::with_capacity(2 * hash.len());
+    for i in hash {
+        write!(s, "{:02x}", i).unwrap();
+    }
+    s
 }
 
 pub fn crc16(data: &[u8]) -> u16 {
