@@ -789,17 +789,29 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_huffman() {
-        /*
-        chdman createraw -hs 4096 -us 512 -i data.b64 -o huff.chd -c huff
-        */
-        let mut chd = open_chd(include_bytes!("../samples/huff.chd"));
+    fn test_compressed_chd(raw: &[u8]) {
+        let mut chd = open_chd(raw);
         // read hunk
         let mut buf = vec![0; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
 
         chd.validate().unwrap();
+    }
+
+    #[test]
+    fn test_huffman() {
+        /*
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o huff.chd -c huff
+        */
+        test_compressed_chd(include_bytes!("../samples/huff.chd"))
+    }
+
+    #[test]
+    fn test_zlib() {
+        /*
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o zlib.chd -c zlib
+        */
+        test_compressed_chd(include_bytes!("../samples/zlib.chd"))
     }
 
     #[test]

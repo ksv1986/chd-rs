@@ -1,9 +1,12 @@
+extern crate inflate;
+
 use super::Header;
 use crate::bitstream::BitReader;
 use crate::huffman::Huffman as HuffmanDecoder;
 use crate::tags::*;
 use crate::utils::{invalid_data, invalid_data_str};
 use std::io;
+use std::io::Write;
 
 pub trait Decompress {
     fn decompress(&mut self, src: &[u8], dest: &mut [u8]) -> io::Result<()>;
@@ -15,6 +18,7 @@ fn create(header: &Header, tag: u32) -> DecompressType {
     match tag {
         0 => None,
         CHD_CODEC_HUFF => Some(Box::new(Huffman::new())),
+        CHD_CODEC_ZLIB => Some(Box::new(Inflate::new())),
         x => Some(Box::new(Unknown::new(x))),
     }
 }
@@ -72,5 +76,21 @@ impl Decompress for Huffman {
                 "codec:huffman: not enough compressed data",
             )),
         }
+    }
+}
+
+pub struct Inflate {}
+
+impl Inflate {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+impl Decompress for Inflate {
+    fn decompress(&mut self, src: &[u8], dest: &mut [u8]) -> io::Result<()> {
+        let mut inflate = inflate::InflateWriter::new(dest);
+        inflate.write(&src)?;
+        Ok(())
     }
 }
