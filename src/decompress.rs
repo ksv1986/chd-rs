@@ -3,6 +3,7 @@ extern crate inflate;
 use super::Header;
 use crate::bitstream::BitReader;
 use crate::huffman::Huffman as HuffmanDecoder;
+use crate::lzma::*;
 use crate::tags::*;
 use crate::utils::{invalid_data, invalid_data_str};
 use std::io;
@@ -18,6 +19,7 @@ fn create(header: &Header, tag: u32) -> DecompressType {
     match tag {
         0 => None,
         CHD_CODEC_HUFF => Some(Box::new(Huffman::new())),
+        CHD_CODEC_LZMA => Some(Box::new(Lzma::new(header.hunkbytes).unwrap())),
         CHD_CODEC_ZLIB => Some(Box::new(Inflate::new())),
         x => Some(Box::new(Unknown::new(x))),
     }
@@ -92,5 +94,41 @@ impl Decompress for Inflate {
         let mut inflate = inflate::InflateWriter::new(dest);
         inflate.write(&src)?;
         Ok(())
+    }
+}
+
+pub struct Lzma {
+    handle: usize,
+}
+
+impl Lzma {
+    pub fn new(hunkbytes: u32) -> io::Result<Self> {
+        let handle = unsafe { lzma_create(hunkbytes) };
+        match handle {
+            0 => Err(invalid_data_str("failed to create lzma decoder")),
+            _ => Ok(Self { handle }),
+        }
+    }
+}
+
+impl Drop for Lzma {
+    fn drop(&mut self) {
+        unsafe { lzma_destroy(self.handle) };
+    }
+}
+
+impl Decompress for Lzma {
+    fn decompress(&mut self, src: &[u8], dest: &mut [u8]) -> io::Result<()> {
+        let error = unsafe {
+            let srclen = src.len() as u32;
+            let psrc = src.as_ptr();
+            let dstlen = dest.len() as u32;
+            let pdst = dest.as_mut_ptr();
+            lzma_decompress(self.handle, psrc, srclen, pdst, dstlen)
+        };
+        match error {
+            0 => Ok(()),
+            _ => Err(invalid_data_str("lzma decompression failed")),
+        }
     }
 }

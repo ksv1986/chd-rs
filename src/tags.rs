@@ -1,4 +1,5 @@
 pub const CHD_CODEC_HUFF: u32 = make_tag(['h', 'u', 'f', 'f']);
+pub const CHD_CODEC_LZMA: u32 = make_tag(['l', 'z', 'm', 'a']);
 pub const CHD_CODEC_ZLIB: u32 = make_tag(['z', 'l', 'i', 'b']);
 
 pub const fn make_tag(data: [char; 4]) -> u32 {

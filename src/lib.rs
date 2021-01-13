@@ -1,6 +1,7 @@
 mod bitstream;
 mod decompress;
 mod huffman;
+mod lzma;
 pub mod tags;
 pub mod utils;
 use bitstream::BitReader;
@@ -804,6 +805,14 @@ mod tests {
         chdman createraw -hs 4096 -us 512 -i data.b64 -o huff.chd -c huff
         */
         test_compressed_chd(include_bytes!("../samples/huff.chd"))
+    }
+
+    #[test]
+    fn test_lzma() {
+        /*
+        chdman createraw -hs 4096 -us 512 -i data.b64 -o lzma.chd -c lzma
+        */
+        test_compressed_chd(include_bytes!("../samples/lzma.chd"))
     }
 
     #[test]
