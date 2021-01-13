@@ -402,6 +402,7 @@ fn read_hunk_at<T: R>(
     let (compression, offset, _) = maphunk;
     match compression {
         COMPRESSION_NONE => io.read_at(offset, buf),
+        COMPRESSION_SELF => read_hunk(io, map, decompress, offset as usize, hunksize, buf),
         COMPRESSION_TYPE_0 | COMPRESSION_TYPE_1 | COMPRESSION_TYPE_2 | COMPRESSION_TYPE_3 => {
             let dindex = (compression - COMPRESSION_TYPE_0) as usize;
             decompress_hunk(io, maphunk, dindex, decompress, buf)
@@ -542,6 +543,10 @@ impl<T: R> Chd<T> {
                     self.hunk_count()
                 ),
             ));
+        }
+        let maphunk = self.map.locate(hunknum);
+        if maphunk.0 == COMPRESSION_SELF {
+            return self.validate_hunk(maphunk.1 as usize);
         }
         let mut buf = vec![0; self.hunk_size()];
         self.read_hunk(hunknum, &mut buf)?;
@@ -749,6 +754,18 @@ mod tests {
         let mut buf = vec![0; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
 
+        chd.validate().unwrap();
+    }
+
+    #[test]
+    fn test_compression_self() {
+        /* generate file with lots of repetitions
+        tr \\000 A < /dev/zero | dd of=a.bin bs=44267 count=1
+        chdman createraw -hs 4096 -us 512 -i a.bin -o self.chd -c huff
+        */
+        let mut chd = open_chd(include_bytes!("../samples/self.chd"));
+        let mut buf = vec![1; chd.hunk_size()];
+        chd.read_hunk(0, &mut buf).unwrap();
         chd.validate().unwrap();
     }
 }
