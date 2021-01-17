@@ -17,3 +17,9 @@ inflate = "0.4"
 
 [build-dependencies]
 cc = "1.0"
+
+[features]
+default = ["write_nop"]
+
+# implement io::Write as nop
+write_nop = []

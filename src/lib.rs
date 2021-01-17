@@ -722,6 +722,22 @@ impl<T: R> Read for Chd<T> {
     }
 }
 
+#[cfg(feature = "write_nop")]
+impl<T: R> Write for Chd<T> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // only advance file position
+        let hasbytes = self.header.size - self.pos as u64;
+        Ok(if hasbytes < buf.len() as u64 {
+            hasbytes as usize
+        } else {
+            buf.len()
+        })
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +882,16 @@ mod tests {
         let mut sample = vec![0; image.len()];
         chd.read_at(0, &mut sample).unwrap();
         assert_eq!(sample, image);
+    }
+
+    #[cfg(feature = "write_nop")]
+    #[test]
+    fn test_write() {
+        let mut chd = open_chd(include_bytes!("../samples/none.chd"));
+        let buf = [42; 4096];
+        chd.seek(SeekFrom::Start(0)).unwrap();
+        assert_eq!(chd.write(&buf).unwrap(), buf.len());
+        chd.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(chd.write(&buf).unwrap(), 0);
     }
 }
