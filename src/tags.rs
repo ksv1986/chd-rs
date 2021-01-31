@@ -2,6 +2,7 @@ pub const CHD_CODEC_HUFF: u32 = make_tag(['h', 'u', 'f', 'f']);
 pub const CHD_CODEC_FLAC: u32 = make_tag(['f', 'l', 'a', 'c']);
 pub const CHD_CODEC_LZMA: u32 = make_tag(['l', 'z', 'm', 'a']);
 pub const CHD_CODEC_ZLIB: u32 = make_tag(['z', 'l', 'i', 'b']);
+pub const CHD_CODEC_CD_FLAC: u32 = make_tag(['c', 'd', 'f', 'l']);
 pub const CHD_CODEC_CD_LZMA: u32 = make_tag(['c', 'd', 'l', 'z']);
 pub const CHD_CODEC_CD_ZLIB: u32 = make_tag(['c', 'd', 'z', 'l']);
 

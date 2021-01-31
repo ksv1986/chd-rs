@@ -9,8 +9,7 @@ use crate::huffman::Huffman as HuffmanDecoder;
 use crate::lzma::*;
 use crate::tags::*;
 use crate::utils::*;
-use claxon::frame::FrameReader;
-use claxon::input::BufferedReader;
+use claxon::frame::{Block, FrameReader};
 use std::io;
 use std::io::{Cursor, Write};
 
@@ -27,6 +26,7 @@ fn create(header: &Header, tag: u32) -> DecompressType {
         CHD_CODEC_FLAC => Some(Box::new(Flac::new())),
         CHD_CODEC_LZMA => Some(Box::new(Lzma::new(header.hunkbytes).unwrap())),
         CHD_CODEC_ZLIB => Some(Box::new(Inflate::new())),
+        CHD_CODEC_CD_FLAC => Some(Box::new(CdFlac::new(header.hunkbytes))),
         CHD_CODEC_CD_LZMA => Some(Box::new(CdDecompress::construct(
             Lzma::new(header.hunkbytes).unwrap(),
             Inflate::new(),
@@ -152,9 +152,28 @@ impl Decompress for Lzma {
 pub struct Flac {}
 
 impl Flac {
+    pub const SAMPLE_SIZE: usize = 4; // 16bit stereo
+
     pub fn new() -> Self {
         Self {}
     }
+}
+
+// buffer is moved into resulting block
+fn flac_decompress(src: &[u8], buffer: Vec<i32>) -> io::Result<(Block, usize)> {
+    let input = Cursor::new(src);
+    let mut frame_reader = FrameReader::new(input);
+    let result = frame_reader
+        .read_next_or_eof(buffer)
+        .map_err(|_| invalid_data_str("flac: failed to decode frame"))?;
+    let block = result.ok_or(invalid_data_str("flac: data is too short"))?;
+    if block.channels() != 2 {
+        return Err(invalid_data(format!(
+            "flac: expected stereo, but got {} channel samples",
+            block.channels()
+        )));
+    }
+    Ok((block, frame_reader.into_inner().position() as usize))
 }
 
 impl Decompress for Flac {
@@ -169,25 +188,15 @@ impl Decompress for Flac {
                 )))
             }
         };
-        let input = Cursor::new(&src[1..]);
-        let buffered_reader = BufferedReader::new(input);
-        let mut frame_reader = FrameReader::new(buffered_reader);
-        let frame_size = 4; // 16bit stereo
+        let frame_size = Flac::SAMPLE_SIZE;
         let num_frames = dest.len() / frame_size;
-        let buffer = vec![0; num_frames];
-        let result = frame_reader
-            .read_next_or_eof(buffer)
-            .map_err(|_| invalid_data_str("flac: failed to decode frame"))?;
-        let block = result.ok_or(invalid_data_str("flac: data is too short"))?;
+        let buffer = vec![0; 2 * num_frames]; // 2 channe;s
+        let block = flac_decompress(&src[1..], buffer)?.0;
         if block.duration() != num_frames as u32 {
-            return Err(invalid_data_str(
-                "flac: decoded duration doesn't match number of frames in hunk",
-            ));
-        }
-        if block.channels() != 2 {
             return Err(invalid_data(format!(
-                "flac: expected stereo, but got {} channel samples",
-                block.channels()
+                "flac: decoded duration {} doesn't match number of frames in hunk {}",
+                block.duration(),
+                num_frames
             )));
         }
         for (i, (sl, sr)) in block.stereo_samples().enumerate() {
@@ -265,6 +274,65 @@ impl<B: Decompress, S: Decompress> Decompress for CdDecompress<B, S> {
                 copy_from(sector, &cd::SYNC_HEADER);
                 ecc::generate(sector);
             }
+        }
+        Ok(())
+    }
+}
+
+struct CdFlac {
+    buffer: Vec<u8>,
+    inflate: Inflate,
+}
+
+impl CdFlac {
+    const SAMPLE_PER_FRAME: usize = cd::MAX_SECTOR_DATA / Flac::SAMPLE_SIZE;
+
+    pub fn new(hunkbytes32: u32) -> Self {
+        let hunkbytes = hunkbytes32 as usize;
+        assert!(hunkbytes % cd::FRAME_SIZE == 0);
+        let num_frames = hunkbytes / cd::FRAME_SIZE;
+        Self {
+            buffer: vec![0; num_frames * cd::MAX_SUBCODE_DATA],
+            inflate: Inflate::new(),
+        }
+    }
+}
+
+impl Decompress for CdFlac {
+    fn decompress(&mut self, src: &[u8], dest: &mut [u8]) -> io::Result<()> {
+        let mut src = src;
+        let frames = dest.len() / cd::FRAME_SIZE;
+
+        // first decompress flac data until all compressed samples are consumed
+        let mut samples = frames * Self::SAMPLE_PER_FRAME;
+        let mut sample_start = 0;
+        while samples > 0 {
+            let buffer = vec![0; 2 * samples]; // 2 channels
+            let (block, pos) = flac_decompress(src, buffer)?;
+            // in decoded block all samples are packed together. reassemble frames
+            let decoded_samples = block.duration() as usize;
+            for (i, (sl, sr)) in block.stereo_samples().enumerate() {
+                let i = sample_start + i;
+                let frame = i / Self::SAMPLE_PER_FRAME;
+                let frame_offs = frame * cd::FRAME_SIZE;
+                let sample_offs = frame_offs + (i % Self::SAMPLE_PER_FRAME) * Flac::SAMPLE_SIZE;
+                write_be16(&mut dest[sample_offs + 0..sample_offs + 2], sl as u16);
+                write_be16(&mut dest[sample_offs + 2..sample_offs + 4], sr as u16);
+            }
+            samples -= decoded_samples;
+            src = &src[pos..];
+            sample_start += decoded_samples;
+        }
+        // then decompress subcode data
+        self.inflate.decompress(src, &mut self.buffer)?;
+        for frame in 0..frames {
+            let frame_offs = frame * cd::FRAME_SIZE;
+            let subcode_offs = frame_offs + cd::MAX_SECTOR_DATA;
+            let subcode = &mut dest[subcode_offs..subcode_offs + cd::MAX_SUBCODE_DATA];
+            copy_from(
+                subcode,
+                &self.buffer[frame * cd::MAX_SUBCODE_DATA..(frame + 1) * cd::MAX_SUBCODE_DATA],
+            );
         }
         Ok(())
     }

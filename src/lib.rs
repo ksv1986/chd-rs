@@ -850,9 +850,17 @@ mod tests {
     }
 
     #[test]
-    fn test_cdlz() {
+    fn test_cdfl() {
         /*
         ffmpeg -i /usr/share/sounds/freedesktop/stereo/bell.oga -o bell.wav
+        chdman createcd -i bell.cue -o cdfl.chd -c cdfl
+         */
+        test_compressed_chd(include_bytes!("../samples/cdfl.chd"))
+    }
+
+    #[test]
+    fn test_cdlz() {
+        /*
         chdman createcd -i bell.cue -o cdlz.chd -c cdlz
          */
         test_compressed_chd(include_bytes!("../samples/cdlz.chd"))
