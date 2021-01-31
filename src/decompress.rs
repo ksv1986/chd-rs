@@ -3,10 +3,12 @@ extern crate inflate;
 
 use super::Header;
 use crate::bitstream::BitReader;
+use crate::cd;
+use crate::ecc;
 use crate::huffman::Huffman as HuffmanDecoder;
 use crate::lzma::*;
 use crate::tags::*;
-use crate::utils::{invalid_data, invalid_data_str, write_be16, write_le16};
+use crate::utils::*;
 use claxon::frame::FrameReader;
 use claxon::input::BufferedReader;
 use std::io;
@@ -25,6 +27,16 @@ fn create(header: &Header, tag: u32) -> DecompressType {
         CHD_CODEC_FLAC => Some(Box::new(Flac::new())),
         CHD_CODEC_LZMA => Some(Box::new(Lzma::new(header.hunkbytes).unwrap())),
         CHD_CODEC_ZLIB => Some(Box::new(Inflate::new())),
+        CHD_CODEC_CD_LZMA => Some(Box::new(CdDecompress::construct(
+            Lzma::new(header.hunkbytes).unwrap(),
+            Inflate::new(),
+            header.hunkbytes,
+        ))),
+        CHD_CODEC_CD_ZLIB => Some(Box::new(CdDecompress::construct(
+            Inflate::new(),
+            Inflate::new(),
+            header.hunkbytes,
+        ))),
         x => Some(Box::new(Unknown::new(x))),
     }
 }
@@ -181,6 +193,78 @@ impl Decompress for Flac {
         for (i, (sl, sr)) in block.stereo_samples().enumerate() {
             write_endian(&mut dest[i * frame_size + 0..i * frame_size + 2], sl as u16);
             write_endian(&mut dest[i * frame_size + 2..i * frame_size + 4], sr as u16);
+        }
+        Ok(())
+    }
+}
+
+struct CdDecompress<B: Decompress, S: Decompress> {
+    base: B,
+    subcode: S,
+    buffer: Vec<u8>,
+}
+
+impl<B: Decompress, S: Decompress> CdDecompress<B, S> {
+    fn construct(base: B, subcode: S, hunkbytes: u32) -> Self {
+        Self {
+            base,
+            subcode,
+            buffer: vec![0; hunkbytes as usize],
+        }
+    }
+}
+
+impl<B: Decompress, S: Decompress> Decompress for CdDecompress<B, S> {
+    fn decompress(&mut self, src: &[u8], dest: &mut [u8]) -> io::Result<()> {
+        let frames = dest.len() / cd::FRAME_SIZE;
+        let ecc_bytes = (frames + 7) / 8;
+        let (compr_start, compr_len) = if dest.len() <= u16::MAX as usize {
+            (
+                ecc_bytes + 2,
+                read_be16(&src[ecc_bytes..ecc_bytes + 2]) as usize,
+            )
+        } else {
+            (
+                ecc_bytes + 3,
+                read_be24(&src[ecc_bytes..ecc_bytes + 3]) as usize,
+            )
+        };
+
+        let compr_end = compr_start + compr_len;
+        let compressed = &src[compr_start..compr_end];
+        let subcode = &src[compr_end..];
+        let subcode_start = frames * cd::MAX_SECTOR_DATA;
+        let subcode_end = subcode_start + frames * cd::MAX_SUBCODE_DATA;
+
+        self.base
+            .decompress(&compressed, &mut self.buffer[..subcode_start])?;
+        self.subcode
+            .decompress(&subcode, &mut self.buffer[subcode_start..subcode_end])?;
+
+        // buffer contains first all frames data, then all frames subcode. reassemble frames
+        for i in 0..frames {
+            let frame_offs = i * cd::FRAME_SIZE;
+
+            let data_offs = i * cd::MAX_SECTOR_DATA;
+            let framedata = &mut dest[frame_offs..frame_offs + cd::MAX_SECTOR_DATA];
+            copy_from(
+                framedata,
+                &self.buffer[data_offs..data_offs + framedata.len()],
+            );
+
+            let subcode_offs = subcode_start + i * cd::MAX_SUBCODE_DATA;
+            let framesubcode =
+                &mut dest[frame_offs + cd::MAX_SECTOR_DATA..frame_offs + cd::FRAME_SIZE];
+            copy_from(
+                framesubcode,
+                &self.buffer[subcode_offs..subcode_offs + framesubcode.len()],
+            );
+
+            if src[i / 8] & (1 << (i % 8)) != 0 {
+                let sector = &mut dest[frame_offs..frame_offs + cd::MAX_SECTOR_DATA];
+                copy_from(sector, &cd::SYNC_HEADER);
+                ecc::generate(sector);
+            }
         }
         Ok(())
     }

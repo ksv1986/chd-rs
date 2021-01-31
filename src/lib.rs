@@ -1,5 +1,7 @@
 mod bitstream;
+pub mod cd;
 mod decompress;
+mod ecc;
 mod huffman;
 mod lzma;
 pub mod tags;
@@ -755,7 +757,6 @@ mod tests {
         let chd = Chd::open(file).unwrap();
         assert_eq!(chd.version(), V5);
         assert_eq!(chd.file_size(), raw.len() as u64);
-        assert_eq!(chd.size(), DATA_SIZE as u64);
         chd
     }
 
@@ -765,6 +766,7 @@ mod tests {
         chdman createraw -hs 4096 -us 512 -i data.b64 -o none.chd -c none
         */
         let mut chd = open_chd(include_bytes!("../samples/none.chd"));
+        assert_eq!(chd.size(), DATA_SIZE as u64);
 
         // read hunk
         let mut buf = vec![0; chd.hunk_size()];
@@ -845,6 +847,23 @@ mod tests {
         chdman createraw -hs 4096 -us 512 -i data.b64 -o zlib.chd -c zlib
         */
         test_compressed_chd(include_bytes!("../samples/zlib.chd"))
+    }
+
+    #[test]
+    fn test_cdlz() {
+        /*
+        ffmpeg -i /usr/share/sounds/freedesktop/stereo/bell.oga -o bell.wav
+        chdman createcd -i bell.cue -o cdlz.chd -c cdlz
+         */
+        test_compressed_chd(include_bytes!("../samples/cdlz.chd"))
+    }
+
+    #[test]
+    fn test_cdzl() {
+        /*
+        chdman createcd -i bell.cue -o cdzl.chd -c cdzl
+         */
+        test_compressed_chd(include_bytes!("../samples/cdzl.chd"))
     }
 
     #[test]

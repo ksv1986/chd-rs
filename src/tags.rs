@@ -2,6 +2,8 @@ pub const CHD_CODEC_HUFF: u32 = make_tag(['h', 'u', 'f', 'f']);
 pub const CHD_CODEC_FLAC: u32 = make_tag(['f', 'l', 'a', 'c']);
 pub const CHD_CODEC_LZMA: u32 = make_tag(['l', 'z', 'm', 'a']);
 pub const CHD_CODEC_ZLIB: u32 = make_tag(['z', 'l', 'i', 'b']);
+pub const CHD_CODEC_CD_LZMA: u32 = make_tag(['c', 'd', 'l', 'z']);
+pub const CHD_CODEC_CD_ZLIB: u32 = make_tag(['c', 'd', 'z', 'l']);
 
 pub const fn make_tag(data: [char; 4]) -> u32 {
     (data[0] as u32) << 24 | (data[1] as u32) << 16 | (data[2] as u32) << 8 | data[3] as u32
