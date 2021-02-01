@@ -543,18 +543,15 @@ impl<T: R> Chd<T> {
         writeln!(to, "Total Hunks: {}", self.hunk_count())?;
         writeln!(to, "Unit Size: {}", self.unit_size())?;
         write!(to, "Compression:")?;
-        for i in 0..4 {
-            match self.header.compressors[i] {
-                0 => {
-                    if i == 0 {
-                        print!(" none");
-                    }
-                    break;
-                }
-                tag => {
-                    write!(to, " {}", tag_string(tag))?;
+        if self.header.compressors[0] != 0 {
+            for i in 0..4 {
+                match self.header.compressors[i] {
+                    0 => break,
+                    tag => write!(to, " {}", tag_string(tag))?,
                 }
             }
+        } else {
+            write!(to, " none")?;
         }
         writeln!(to, "")?;
         let ratio = 1e2 * (self.file_size() as f32) / (self.size() as f32);
@@ -563,7 +560,7 @@ impl<T: R> Chd<T> {
         hex_writeln(to, &self.header.sha1)?;
         write!(to, "Data SHA1: ")?;
         hex_writeln(to, &self.header.rawsha1)?;
-        for i in self.header.parentsha1.iter() {
+        for i in &self.header.parentsha1 {
             if *i > 0 {
                 write!(to, "Parent SHA1: ")?;
                 hex_writeln(to, &self.header.parentsha1)?;
@@ -797,7 +794,7 @@ mod tests {
             (hunksize - 1, hunksize + 2),
             (0, chd.size() as usize),
         ];
-        for (offset, length) in fixtures.iter() {
+        for (offset, length) in &fixtures {
             let end = *offset + *length;
             let original = &image[*offset..end];
             let mut sample = vec![0; *length];
