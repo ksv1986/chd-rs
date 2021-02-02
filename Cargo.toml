@@ -14,6 +14,7 @@ build = "build.rs"
 claxon = "0.4"
 crc16 = "0.4"
 inflate = "0.4"
+sha1 = "0.6"
 
 [build-dependencies]
 cc = "1.0"

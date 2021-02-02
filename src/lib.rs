@@ -1,3 +1,5 @@
+extern crate sha1;
+
 mod bitstream;
 pub mod cd;
 mod decompress;
@@ -495,6 +497,10 @@ impl<T: R> Chd<T> {
         Ok(())
     }
 
+    pub fn compressed(&self) -> bool {
+        self.header.compressors[0] != 0
+    }
+
     pub fn file_size(&self) -> u64 {
         self.filesize
     }
@@ -543,7 +549,7 @@ impl<T: R> Chd<T> {
         writeln!(to, "Total Hunks: {}", self.hunk_count())?;
         writeln!(to, "Unit Size: {}", self.unit_size())?;
         write!(to, "Compression:")?;
-        if self.header.compressors[0] != 0 {
+        if self.compressed() {
             for i in 0..4 {
                 match self.header.compressors[i] {
                     0 => break,
@@ -596,11 +602,38 @@ impl<T: R> Chd<T> {
         }
     }
 
+    // Check each hunk data match map checksum
     pub fn validate(&mut self) -> io::Result<()> {
         for i in 0..self.hunk_count() {
             self.validate_hunk(i)?;
         }
         Ok(())
+    }
+
+    // Check chd data match header checksum
+    pub fn verify(&mut self) -> io::Result<()> {
+        if !self.compressed() {
+            return Err(invalid_data_str(
+                "chd: uncompressed file doesn't have checksum",
+            ));
+        }
+        let mut sha1 = sha1::Sha1::new();
+        let mut buffer = vec![0; self.hunk_size()];
+        self.seek(SeekFrom::Start(0))?;
+        for _ in 0..self.hunk_count() {
+            let size = self.read(&mut buffer)?;
+            sha1.update(&buffer[..size]);
+        }
+        let digest = sha1.digest().bytes();
+        if digest == self.header.rawsha1 {
+            Ok(())
+        } else {
+            Err(invalid_data(format!(
+                "chd: data sha1 {} doesn't match header rawsha1 {}",
+                hex_string(&digest),
+                hex_string(&self.header.rawsha1)
+            )))
+        }
     }
 
     fn read_hunk(&mut self, hunknum: usize, buf: &mut [u8]) -> io::Result<()> {
@@ -748,13 +781,19 @@ mod tests {
     */
     const DATA_SIZE: usize = 44267;
     const IMAGE: &[u8] = include_bytes!("../samples/data.b64");
+    type MemChd<'a> = Chd<Cursor<&'a [u8]>>;
 
-    fn open_chd(raw: &[u8]) -> Chd<Cursor<&[u8]>> {
+    fn open_chd(raw: &[u8]) -> MemChd {
         let file = Cursor::new(raw);
         let chd = Chd::open(file).unwrap();
         assert_eq!(chd.version(), V5);
         assert_eq!(chd.file_size(), raw.len() as u64);
         chd
+    }
+
+    fn validate_all(chd: &mut MemChd) {
+        chd.validate().unwrap();
+        chd.verify().unwrap();
     }
 
     #[test]
@@ -810,8 +849,7 @@ mod tests {
         // read hunk
         let mut buf = vec![0; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
-
-        chd.validate().unwrap();
+        validate_all(&mut chd);
     }
 
     #[test]
@@ -880,7 +918,7 @@ mod tests {
         let mut chd = open_chd(include_bytes!("../samples/self.chd"));
         let mut buf = vec![1; chd.hunk_size()];
         chd.read_hunk(0, &mut buf).unwrap();
-        chd.validate().unwrap();
+        validate_all(&mut chd);
     }
 
     #[test]
