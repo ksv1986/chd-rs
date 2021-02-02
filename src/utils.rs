@@ -58,6 +58,13 @@ pub fn write_be24(data: &mut [u8], val: u32) {
     data[0] = (val >> 16) as u8;
 }
 
+pub fn write_be32(data: &mut [u8], val: u32) {
+    data[3] = val as u8;
+    data[2] = (val >> 8) as u8;
+    data[1] = (val >> 16) as u8;
+    data[0] = (val >> 24) as u8;
+}
+
 pub fn write_be48(data: &mut [u8], val: u64) {
     data[5] = val as u8;
     data[4] = (val >> 8) as u8;

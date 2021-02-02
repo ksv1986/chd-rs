@@ -56,6 +56,8 @@ const COMPRESSION_PARENT_0: u8 = 12;
 /* same as the last COMPRESSION_PARENT block + 1 */
 const COMPRESSION_PARENT_1: u8 = 13;
 
+const MDFLAGS_CHECKSUM: u8 = 1;
+
 // Hunk compression, offset in file and length
 type MapHunk = (u8, u64, u32);
 
@@ -451,6 +453,19 @@ fn read_hunk<T: R>(
     read_hunk_at(io, map, decompress, parent, maphunk, hunksize, buf)
 }
 
+#[derive(Clone, Copy)]
+struct MetadataEntry {
+    metatag: u32, // metadata tag
+    offset: u64,  // offset within the file of the header
+    next: u64,    // offset within the file of the next header
+    length: u32,  // length of the metadata
+    flags: u8,    // flag bits
+}
+
+impl MetadataEntry {
+    const SIZE: usize = 16;
+}
+
 type ParentType<T> = Option<Box<Chd<T>>>;
 
 pub struct Chd<T: R> {
@@ -462,6 +477,7 @@ pub struct Chd<T: R> {
     decompress: [DecompressType; 4],
     cache: Vec<u8>,   // cached data for reads not aligned to hunk boundaries
     cachehunk: usize, // cached hunk index
+    cachemeta: Option<(u32, MetadataEntry)>, // cached metadata entry
     parent: ParentType<T>,
 }
 
@@ -480,6 +496,7 @@ impl<T: R> Chd<T> {
             decompress,
             cache: vec![0; hunksize],
             cachehunk: usize::MAX, // definitely out of any hunk index value
+            cachemeta: None,
             parent: None,
         };
         Ok(chd)
@@ -625,15 +642,46 @@ impl<T: R> Chd<T> {
             sha1.update(&buffer[..size]);
         }
         let digest = sha1.digest().bytes();
-        if digest == self.header.rawsha1 {
-            Ok(())
-        } else {
-            Err(invalid_data(format!(
+        if digest != self.header.rawsha1 {
+            return Err(invalid_data(format!(
                 "chd: data sha1 {} doesn't match header rawsha1 {}",
                 hex_string(&digest),
                 hex_string(&self.header.rawsha1)
-            )))
+            )));
         }
+        let mut metasha = Vec::<[u8; 24]>::new();
+        let calcsha = |io: &mut T, entry: &MetadataEntry| -> io::Result<()> {
+            if entry.flags & MDFLAGS_CHECKSUM == 0 {
+                return Ok(());
+            }
+            let mut buf = vec![0; entry.length as usize];
+            io.read_at(entry.offset, &mut buf)?;
+
+            let digest = sha1::Sha1::from(&buf).digest().bytes();
+
+            let mut buf = [0; 24];
+            write_be32(&mut buf[..4], entry.metatag);
+            copy_from(&mut buf[4..], &digest);
+            metasha.push(buf);
+            Ok(())
+        };
+        Self::visit_metadata(&mut self.io, self.header.metaoffset, calcsha)?;
+        metasha.sort();
+
+        let mut sha1 = sha1::Sha1::new();
+        sha1.update(&self.header.rawsha1);
+        for s in metasha.into_iter() {
+            sha1.update(&s);
+        }
+        let digest = sha1.digest().bytes();
+        if digest != self.header.sha1 {
+            return Err(invalid_data(format!(
+                "chd: overall sha1 {} doesn't match header sha1 {}",
+                hex_string(&digest),
+                hex_string(&self.header.sha1)
+            )));
+        }
+        Ok(())
     }
 
     fn read_hunk(&mut self, hunknum: usize, buf: &mut [u8]) -> io::Result<()> {
@@ -647,6 +695,114 @@ impl<T: R> Chd<T> {
             hunksize,
             buf,
         )
+    }
+
+    fn read_metadata_entry(
+        io: &mut T,
+        offset: u64,
+        header: &mut [u8],
+    ) -> io::Result<MetadataEntry> {
+        io.read_at(offset, header)?;
+        Ok(MetadataEntry {
+            metatag: read_be32(&header[0..4]),
+            offset: offset + MetadataEntry::SIZE as u64,
+            next: read_be64(&header[8..16]),
+            length: read_be24(&header[5..8]),
+            flags: header[4],
+        })
+    }
+
+    fn visit_metadata<F>(io: &mut T, mut offset: u64, mut f: F) -> io::Result<()>
+    where
+        F: FnMut(&mut T, &MetadataEntry) -> io::Result<()>,
+    {
+        let mut buffer = [0; MetadataEntry::SIZE];
+        while offset > 0 {
+            let entry = Self::read_metadata_entry(io, offset, &mut buffer)?;
+            f(io, &entry)?;
+            offset = entry.next;
+        }
+        Ok(())
+    }
+
+    fn find_metadata(&mut self, tag: u32, index: u32) -> io::Result<Option<MetadataEntry>> {
+        if let Some((i, entry)) = self.cachemeta {
+            if tag == entry.metatag && i == index {
+                return Ok(Some(entry));
+            }
+        }
+
+        let mut buffer = [0; MetadataEntry::SIZE];
+        let mut offset = self.header.metaoffset;
+        let mut i = 0;
+        while offset > 0 {
+            let entry = Self::read_metadata_entry(&mut self.io, offset, &mut buffer)?;
+            if tag == entry.metatag {
+                if i == index {
+                    self.cachemeta = Some((i, entry));
+                    return Ok(Some(entry));
+                }
+                i += 1;
+            }
+            offset = entry.next;
+        }
+        Ok(None)
+    }
+
+    pub fn read_metadata_at(
+        &mut self,
+        tag: u32,
+        index: u32,
+        offset: usize,
+        buf: &mut [u8],
+    ) -> io::Result<Option<usize>> {
+        match self.find_metadata(tag, index)? {
+            Some(entry) => {
+                let length = entry.length as usize;
+                if length <= offset {
+                    return Ok(Some(0));
+                }
+                let available = length - offset;
+                let chunk = std::cmp::min(available, buf.len());
+                self.io
+                    .read_at(entry.offset + offset as u64, &mut buf[..chunk])?;
+                Ok(Some(available))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn read_metadata(&mut self, tag: u32, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        self.read_metadata_at(tag, 0, 0, buf)
+    }
+
+    pub fn dump_metadata<W: Write>(&mut self, to: &mut W) -> io::Result<()> {
+        if self.header.metaoffset == 0 {
+            writeln!(to, "Metadata: none")?;
+            return Ok(());
+        }
+        writeln!(to, "Metadata:")?;
+        let mut buf = [0; 32];
+        let buflen = buf.len();
+        Self::visit_metadata(&mut self.io, self.header.metaoffset, |io, entry| {
+            let length = entry.length as usize;
+            let (chunk, tail) = if length > buflen {
+                (&mut buf[..buflen - 2], "...")
+            } else {
+                (&mut buf[..length], "")
+            };
+            io.read_at(entry.offset, chunk)?;
+            writeln!(
+                to,
+                "  {}:{:02x}: ({}){}{}",
+                tag_string(entry.metatag),
+                entry.flags,
+                entry.length,
+                hex_string(chunk),
+                tail
+            )?;
+            Ok(())
+        })
     }
 }
 
@@ -842,6 +998,9 @@ mod tests {
             // check read updates pos
             assert_eq!(chd.seek(SeekFrom::Current(0)).unwrap(), end as u64);
         }
+
+        // try read missing metadata
+        assert!(chd.read_metadata(metadata::AV, &mut buf).unwrap().is_none());
     }
 
     fn test_compressed_chd(raw: &[u8]) {
@@ -944,6 +1103,59 @@ mod tests {
         let mut sample = vec![0; image.len()];
         chd.read_at(0, &mut sample).unwrap();
         assert_eq!(sample, image);
+    }
+
+    #[test]
+    fn test_metadata() {
+        /*
+        chdman dumpmeta -i cdlz.chd -o CHT2.bin -t CHT2
+        */
+        const META_BOGUS: u32 = make_tag(['A', 'B', 'C', 'D']);
+        let mut chd = open_chd(include_bytes!("../samples/cdlz.chd"));
+        let mut buf = [0; 1024];
+        let size = chd
+            .read_metadata(metadata::CDROM_TRACK2, &mut buf)
+            .unwrap()
+            .unwrap();
+        let meta = include_bytes!("../samples/CHT2.bin");
+        assert_eq!(size, meta.len());
+        assert_eq!(&buf[..size], meta);
+        assert_eq!(
+            chd.read_metadata(metadata::CDROM_TRACK2, &mut buf[..0])
+                .unwrap()
+                .unwrap(),
+            size
+        );
+        // println!("{}", hex_string(&buf[..size]));
+        assert!(chd.read_metadata(META_BOGUS, &mut buf).unwrap().is_none());
+        /*
+        cp none.chd temp.chd
+        chdman addmeta -i temp.chd -t ABCD -vf data.b64
+        chdman addmeta -i temp.chd -t BCDE -vt BCDE
+        chdman addmeta -i temp.chd -t CDEF -vt CDEF -nocs
+        chdman addmeta -i temp.chd -t DEFG -vt DEFG
+        chdman addmeta -i temp.chd -t EFGH -vt EFGH
+        chdman copy -i temp.chd -o meta.chd -c huff,zlib
+        */
+        let meta = IMAGE;
+        let mut chd = open_chd(include_bytes!("../samples/meta.chd"));
+        assert_eq!(
+            chd.read_metadata(META_BOGUS, &mut buf[..0])
+                .unwrap()
+                .unwrap(),
+            meta.len()
+        );
+        let mut offset = 0;
+        while offset < meta.len() {
+            let available = chd
+                .read_metadata_at(META_BOGUS, 0, offset, &mut buf)
+                .unwrap()
+                .unwrap();
+            let have = std::cmp::min(available, buf.len());
+            assert_eq!(&buf[..have], &meta[offset..offset + have]);
+            offset += have;
+        }
+        chd.verify().unwrap();
     }
 
     #[cfg(feature = "write_nop")]

@@ -11,7 +11,8 @@ fn main() -> io::Result<()> {
         .expect("Usage: rchdtool <chd-file>");
     println!("Input file: {:?}", path);
     let file = File::open(path)?;
-    let chd = Chd::open(file)?;
+    let mut chd = Chd::open(file)?;
     chd.write_summary(&mut std::io::stdout())?;
+    chd.dump_metadata(&mut std::io::stdout())?;
     Ok(())
 }
