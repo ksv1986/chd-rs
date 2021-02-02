@@ -6,6 +6,29 @@ pub const CHD_CODEC_CD_FLAC: u32 = make_tag(['c', 'd', 'f', 'l']);
 pub const CHD_CODEC_CD_LZMA: u32 = make_tag(['c', 'd', 'l', 'z']);
 pub const CHD_CODEC_CD_ZLIB: u32 = make_tag(['c', 'd', 'z', 'l']);
 
+#[allow(dead_code)]
+pub mod metadata {
+    use super::make_tag;
+    pub const HARD_DISK: u32 = make_tag(['G', 'D', 'D', 'D']);
+    pub const HARD_DISK_IDENT: u32 = make_tag(['I', 'D', 'N', 'T']);
+    pub const HARD_DISK_KEY: u32 = make_tag(['K', 'E', 'Y', ' ']);
+
+    // pcmcia CIS information
+    pub const PCMCIA_CIS: u32 = make_tag(['C', 'I', 'S', ' ']);
+
+    // standard CD-ROM metadata
+    pub const CDROM_OLD: u32 = make_tag(['C', 'H', 'C', 'D']);
+    pub const CDROM_TRACK: u32 = make_tag(['C', 'H', 'T', 'R']);
+    pub const CDROM_TRACK2: u32 = make_tag(['C', 'H', 'T', '2']);
+    pub const GDROM_OLD: u32 = make_tag(['C', 'H', 'G', 'T']);
+    pub const GDROM_TRACK: u32 = make_tag(['C', 'H', 'G', 'D']);
+
+    // standard A/V metadata
+    pub const AV: u32 = make_tag(['A', 'V', 'A', 'V']);
+    // A/V laserdisc frame metadata
+    pub const AV_LD: u32 = make_tag(['A', 'V', 'L', 'D']);
+}
+
 pub const fn make_tag(data: [char; 4]) -> u32 {
     (data[0] as u32) << 24 | (data[1] as u32) << 16 | (data[2] as u32) << 8 | data[3] as u32
 }
