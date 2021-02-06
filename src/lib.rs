@@ -776,6 +776,17 @@ impl<T: R> Chd<T> {
         self.read_metadata_at(tag, 0, 0, buf)
     }
 
+    pub fn read_metadata_simple(&mut self, tag: u32) -> io::Result<Option<Vec<u8>>> {
+        match self.find_metadata(tag, 0)? {
+            Some(entry) => {
+                let mut meta = vec![0; entry.length as usize];
+                self.io.read_at(entry.offset, &mut meta)?;
+                Ok(Some(meta))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn dump_metadata<W: Write>(&mut self, to: &mut W) -> io::Result<()> {
         if self.header.metaoffset == 0 {
             writeln!(to, "Metadata: none")?;
