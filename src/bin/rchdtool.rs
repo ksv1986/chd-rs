@@ -14,5 +14,6 @@ fn main() -> io::Result<()> {
     let mut chd = Chd::open(file)?;
     chd.write_summary(&mut std::io::stdout())?;
     chd.dump_metadata(&mut std::io::stdout())?;
+    chd.write_stat(&mut std::io::stdout())?;
     Ok(())
 }

@@ -74,14 +74,44 @@ pub fn write_be48(data: &mut [u8], val: u64) {
     data[0] = (val >> 40) as u8;
 }
 
+#[derive(Default)]
+pub struct IoStat {
+    pub iops: u64,
+    pub bytes: u64,
+    pub seek: u64,
+}
+
+#[derive(Default)]
+pub struct CodecStat {
+    pub iops: u64,
+    pub compressed: u64,
+    pub decompressed: u64,
+}
+
+#[derive(Default)]
+pub struct Stat {
+    pub read: IoStat, // reads from underlaying io
+    pub chd: IoStat,  // reads from chd
+    pub decompress: [CodecStat; 4],
+}
+
 pub trait ReadAt {
-    fn read_at(&mut self, offset: u64, data: &mut [u8]) -> io::Result<()>;
+    fn read_at(&mut self, stat: &mut IoStat, offset: u64, data: &mut [u8]) -> io::Result<()>;
+    fn read_with_stat(&mut self, stat: &mut IoStat, data: &mut [u8]) -> io::Result<()>;
 }
 
 impl<T: R> ReadAt for T {
-    fn read_at(&mut self, offset: u64, data: &mut [u8]) -> io::Result<()> {
+    fn read_at(&mut self, stat: &mut IoStat, offset: u64, data: &mut [u8]) -> io::Result<()> {
         self.seek(SeekFrom::Start(offset))?;
-        self.read_exact(data)
+        stat.seek += 1;
+        self.read_with_stat(stat, data)
+    }
+
+    fn read_with_stat(&mut self, stat: &mut IoStat, data: &mut [u8]) -> io::Result<()> {
+        self.read_exact(data)?;
+        stat.iops += 1;
+        stat.bytes += data.len() as u64;
+        Ok(())
     }
 }
 

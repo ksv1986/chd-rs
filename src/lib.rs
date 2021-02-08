@@ -90,9 +90,9 @@ struct Header {
 }
 
 impl Header {
-    fn read<T: R>(io: &mut T) -> io::Result<(Self, MapType)> {
+    fn read<T: R>(io: &mut T, stat: &mut IoStat) -> io::Result<(Self, MapType)> {
         let mut data = [0u8; 124];
-        io.read_at(0, &mut data)?;
+        io.read_at(stat, 0, &mut data)?;
 
         let magic = &data[0..8];
         if magic != b"MComprHD" {
@@ -106,8 +106,8 @@ impl Header {
             V5 => {
                 header.read_header_v5(&data)?;
                 let map = match header.compressors[0] {
-                    0 => UncompressedMap5::read(io, &header),
-                    _ => CompressedMap5::read(io, &header),
+                    0 => UncompressedMap5::read(io, stat, &header),
+                    _ => CompressedMap5::read(io, stat, &header),
                 }?;
                 Ok((header, map))
             }
@@ -178,10 +178,10 @@ impl UncompressedMap5 {
         4 * hunknum
     }
 
-    fn read<T: R>(io: &mut T, header: &Header) -> io::Result<MapType> {
+    fn read<T: R>(io: &mut T, stat: &mut IoStat, header: &Header) -> io::Result<MapType> {
         let hunkcount = header.hunkcount as usize;
         let mut map = vec![0; Self::offset(hunkcount)];
-        io.read_at(header.mapoffset, &mut map)?;
+        io.read_at(stat, header.mapoffset, &mut map)?;
         Ok(Box::new(Self {
             hunkbytes: header.hunkbytes as u64,
             map,
@@ -224,13 +224,13 @@ impl CompressedMap5 {
         12 * hunknum
     }
 
-    fn read<T: R>(io: &mut T, header: &Header) -> io::Result<MapType> {
+    fn read<T: R>(io: &mut T, stat: &mut IoStat, header: &Header) -> io::Result<MapType> {
         let mut maphdr = [0; 16];
-        io.read_at(header.mapoffset, &mut maphdr)?;
+        io.read_at(stat, header.mapoffset, &mut maphdr)?;
 
         let maplength = read_be32(&maphdr[0..4]);
         let mut comprmap = vec![0; maplength as usize];
-        io.read_exact(comprmap.as_mut_slice())?;
+        io.read_with_stat(stat, comprmap.as_mut_slice())?;
 
         Ok(Box::new(Self::decompress(header, &maphdr, &comprmap)?))
     }
@@ -381,6 +381,7 @@ impl Map for CompressedMap5 {
 
 fn decompress_hunk<T: R>(
     io: &mut T,
+    stat: &mut Stat,
     maphunk: MapHunk,
     dindex: usize,
     decompress: &mut [DecompressType],
@@ -394,8 +395,12 @@ fn decompress_hunk<T: R>(
             offset, dindex, compression
         )))?;
     let mut compbuf = vec![0; length as usize];
-    io.read_at(offset, compbuf.as_mut_slice())?;
-    d.decompress(&compbuf, buf)
+    io.read_at(&mut stat.read, offset, compbuf.as_mut_slice())?;
+    d.decompress(&compbuf, buf)?;
+    stat.decompress[dindex].iops += 1;
+    stat.decompress[dindex].compressed += compbuf.len() as u64;
+    stat.decompress[dindex].decompressed += buf.len() as u64;
+    Ok(())
 }
 
 fn deref_parent<T: R>(parent: &mut ParentType<T>, offset: u64) -> io::Result<&mut Chd<T>> {
@@ -407,6 +412,7 @@ fn deref_parent<T: R>(parent: &mut ParentType<T>, offset: u64) -> io::Result<&mu
 
 fn read_hunk_at<T: R>(
     io: &mut T,
+    stat: &mut Stat,
     map: &dyn Map,
     decompress: &mut [DecompressType],
     parent: &mut ParentType<T>,
@@ -416,8 +422,17 @@ fn read_hunk_at<T: R>(
 ) -> io::Result<()> {
     let (compression, offset, _) = maphunk;
     match compression {
-        COMPRESSION_NONE => io.read_at(offset, buf),
-        COMPRESSION_SELF => read_hunk(io, map, decompress, parent, offset as usize, hunksize, buf),
+        COMPRESSION_NONE => io.read_at(&mut stat.read, offset, buf),
+        COMPRESSION_SELF => read_hunk(
+            io,
+            stat,
+            map,
+            decompress,
+            parent,
+            offset as usize,
+            hunksize,
+            buf,
+        ),
         COMPRESSION_PARENT => {
             let parent_chd = deref_parent(parent, offset)?;
             let parent_offs = offset * parent_chd.unit_size_u64();
@@ -428,7 +443,7 @@ fn read_hunk_at<T: R>(
         }
         COMPRESSION_TYPE_0 | COMPRESSION_TYPE_1 | COMPRESSION_TYPE_2 | COMPRESSION_TYPE_3 => {
             let dindex = (compression - COMPRESSION_TYPE_0) as usize;
-            decompress_hunk(io, maphunk, dindex, decompress, buf)
+            decompress_hunk(io, stat, maphunk, dindex, decompress, buf)
         }
         x => Err(invalid_data(format!(
             "hunk@{}: unsupported compression {}",
@@ -441,6 +456,7 @@ fn read_hunk_at<T: R>(
 // to satisfy borrow checker have to move it into free function
 fn read_hunk<T: R>(
     io: &mut T,
+    stat: &mut Stat,
     map: &dyn Map,
     decompress: &mut [DecompressType],
     parent: &mut ParentType<T>,
@@ -450,7 +466,7 @@ fn read_hunk<T: R>(
 ) -> io::Result<()> {
     assert_eq!(buf.len(), hunksize);
     let maphunk = map.locate(hunknum);
-    read_hunk_at(io, map, decompress, parent, maphunk, hunksize, buf)
+    read_hunk_at(io, stat, map, decompress, parent, maphunk, hunksize, buf)
 }
 
 #[derive(Clone, Copy)]
@@ -479,11 +495,13 @@ pub struct Chd<T: R> {
     cachehunk: usize, // cached hunk index
     cachemeta: Option<(u32, MetadataEntry)>, // cached metadata entry
     parent: ParentType<T>,
+    stat: Stat,
 }
 
 impl<T: R> Chd<T> {
     pub fn open(mut io: T) -> io::Result<Chd<T>> {
-        let (header, map) = Header::read(&mut io)?;
+        let mut stat = Stat::default();
+        let (header, map) = Header::read(&mut io, &mut stat.read)?;
         let decompress = decompress::init(&header);
         let filesize = io.seek(SeekFrom::End(0))?;
         let hunksize = header.hunkbytes as usize;
@@ -498,6 +516,7 @@ impl<T: R> Chd<T> {
             cachehunk: usize::MAX, // definitely out of any hunk index value
             cachemeta: None,
             parent: None,
+            stat,
         };
         Ok(chd)
     }
@@ -593,6 +612,65 @@ impl<T: R> Chd<T> {
         Ok(())
     }
 
+    fn write_io_stat<W: Write>(stat: &IoStat, to: &mut W) -> io::Result<()> {
+        writeln!(to, "  Iops: {}", stat.iops)?;
+        if stat.iops == 0 {
+            return Ok(())    
+        }
+        writeln!(to, "  Bytes: {}", stat.bytes)?;
+        writeln!(to, "  Avg: {:.2}", (stat.bytes as f32) / (stat.iops as f32))?;
+        Ok(())
+    }
+
+    fn has_decompress_stat(&self) -> bool {
+        for i in 0..4 {
+            if self.stat.decompress[i].iops > 0 {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn write_decompress_stat<W: Write>(&self, to: &mut W) -> io::Result<()> {
+        for i in 0..4 {
+            if self.header.compressors[i] == 0 {
+                return Ok(())
+            }
+            let stat = &self.stat.decompress[i];
+            if stat.iops == 0 {
+                continue
+            }
+            writeln!(to, " {}:{}:", i, tag_string(self.header.compressors[i]))?;
+            writeln!(to, "  Iops: {}", stat.iops)?;
+            writeln!(to, "  Compressed: {}", stat.compressed)?;
+            writeln!(to, "  Decompressed: {}", stat.decompressed)?;
+        }
+        Ok(())
+    }
+
+    pub fn write_stat<W: Write>(&self, to: &mut W) -> io::Result<()> {
+        writeln!(to, "Stats:")?;
+        writeln!(to, " Chd:")?;
+        Self::write_io_stat(&self.stat.chd, to)?;
+        writeln!(to, " File:")?;
+        Self::write_io_stat(&self.stat.read, to)?;
+        if self.has_decompress_stat() {
+            writeln!(to, " Decompress:")?;
+            self.write_decompress_stat(to)?;
+        }
+        if let Some(parent) = &self.parent {
+            writeln!(to, " Parent:")?;
+            Self::write_io_stat(&parent.stat.chd, to)?;
+            writeln!(to, " Parent File:")?;
+            Self::write_io_stat(&parent.stat.read, to)?;
+            if parent.has_decompress_stat() {
+                writeln!(to, " Parent Decompress:")?;
+                parent.write_decompress_stat(to)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_hunk(&mut self, hunknum: usize) -> io::Result<()> {
         if hunknum >= self.hunk_count() {
             return Err(io::Error::new(
@@ -650,12 +728,12 @@ impl<T: R> Chd<T> {
             )));
         }
         let mut metasha = Vec::<[u8; 24]>::new();
-        let calcsha = |io: &mut T, entry: &MetadataEntry| -> io::Result<()> {
+        let calcsha = |io: &mut T, stat: &mut IoStat, entry: &MetadataEntry| -> io::Result<()> {
             if entry.flags & MDFLAGS_CHECKSUM == 0 {
                 return Ok(());
             }
             let mut buf = vec![0; entry.length as usize];
-            io.read_at(entry.offset, &mut buf)?;
+            io.read_at(stat, entry.offset, &mut buf)?;
 
             let digest = sha1::Sha1::from(&buf).digest().bytes();
 
@@ -665,7 +743,12 @@ impl<T: R> Chd<T> {
             metasha.push(buf);
             Ok(())
         };
-        Self::visit_metadata(&mut self.io, self.header.metaoffset, calcsha)?;
+        Self::visit_metadata(
+            &mut self.io,
+            &mut self.stat.read,
+            self.header.metaoffset,
+            calcsha,
+        )?;
         metasha.sort();
 
         let mut sha1 = sha1::Sha1::new();
@@ -688,6 +771,7 @@ impl<T: R> Chd<T> {
         let hunksize = self.hunk_size();
         read_hunk(
             &mut self.io,
+            &mut self.stat,
             &*self.map,
             &mut self.decompress,
             &mut self.parent,
@@ -699,10 +783,11 @@ impl<T: R> Chd<T> {
 
     fn read_metadata_entry(
         io: &mut T,
+        stat: &mut IoStat,
         offset: u64,
         header: &mut [u8],
     ) -> io::Result<MetadataEntry> {
-        io.read_at(offset, header)?;
+        io.read_at(stat, offset, header)?;
         Ok(MetadataEntry {
             metatag: read_be32(&header[0..4]),
             offset: offset + MetadataEntry::SIZE as u64,
@@ -712,14 +797,14 @@ impl<T: R> Chd<T> {
         })
     }
 
-    fn visit_metadata<F>(io: &mut T, mut offset: u64, mut f: F) -> io::Result<()>
+    fn visit_metadata<F>(io: &mut T, stat: &mut IoStat, mut offset: u64, mut f: F) -> io::Result<()>
     where
-        F: FnMut(&mut T, &MetadataEntry) -> io::Result<()>,
+        F: FnMut(&mut T, &mut IoStat, &MetadataEntry) -> io::Result<()>,
     {
         let mut buffer = [0; MetadataEntry::SIZE];
         while offset > 0 {
-            let entry = Self::read_metadata_entry(io, offset, &mut buffer)?;
-            f(io, &entry)?;
+            let entry = Self::read_metadata_entry(io, stat, offset, &mut buffer)?;
+            f(io, stat, &entry)?;
             offset = entry.next;
         }
         Ok(())
@@ -736,7 +821,8 @@ impl<T: R> Chd<T> {
         let mut offset = self.header.metaoffset;
         let mut i = 0;
         while offset > 0 {
-            let entry = Self::read_metadata_entry(&mut self.io, offset, &mut buffer)?;
+            let entry =
+                Self::read_metadata_entry(&mut self.io, &mut self.stat.read, offset, &mut buffer)?;
             if tag == entry.metatag {
                 if i == index {
                     self.cachemeta = Some((i, entry));
@@ -764,8 +850,11 @@ impl<T: R> Chd<T> {
                 }
                 let available = length - offset;
                 let chunk = std::cmp::min(available, buf.len());
-                self.io
-                    .read_at(entry.offset + offset as u64, &mut buf[..chunk])?;
+                self.io.read_at(
+                    &mut self.stat.read,
+                    entry.offset + offset as u64,
+                    &mut buf[..chunk],
+                )?;
                 Ok(Some(available))
             }
             None => Ok(None),
@@ -780,7 +869,8 @@ impl<T: R> Chd<T> {
         match self.find_metadata(tag, 0)? {
             Some(entry) => {
                 let mut meta = vec![0; entry.length as usize];
-                self.io.read_at(entry.offset, &mut meta)?;
+                self.io
+                    .read_at(&mut self.stat.read, entry.offset, &mut meta)?;
                 Ok(Some(meta))
             }
             None => Ok(None),
@@ -795,25 +885,30 @@ impl<T: R> Chd<T> {
         writeln!(to, "Metadata:")?;
         let mut buf = [0; 32];
         let buflen = buf.len();
-        Self::visit_metadata(&mut self.io, self.header.metaoffset, |io, entry| {
-            let length = entry.length as usize;
-            let (chunk, tail) = if length > buflen {
-                (&mut buf[..buflen - 2], "...")
-            } else {
-                (&mut buf[..length], "")
-            };
-            io.read_at(entry.offset, chunk)?;
-            writeln!(
-                to,
-                "  {}:{:02x}: ({}){}{}",
-                tag_string(entry.metatag),
-                entry.flags,
-                entry.length,
-                hex_string(chunk),
-                tail
-            )?;
-            Ok(())
-        })
+        Self::visit_metadata(
+            &mut self.io,
+            &mut self.stat.read,
+            self.header.metaoffset,
+            |io, stat, entry| {
+                let length = entry.length as usize;
+                let (chunk, tail) = if length > buflen {
+                    (&mut buf[..buflen - 2], "...")
+                } else {
+                    (&mut buf[..length], "")
+                };
+                io.read_at(stat, entry.offset, chunk)?;
+                writeln!(
+                    to,
+                    "  {}:{:02x}: ({}){}{}",
+                    tag_string(entry.metatag),
+                    entry.flags,
+                    entry.length,
+                    hex_string(chunk),
+                    tail
+                )?;
+                Ok(())
+            },
+        )
     }
 }
 
@@ -854,6 +949,7 @@ impl<T: R> Seek for Chd<T> {
             )));
         }
         self.pos = newpos;
+        self.stat.chd.seek += 1;
         Ok(self.pos as u64)
     }
 }
@@ -904,6 +1000,7 @@ impl<T: R> Read for Chd<T> {
                     // self.read_hunk(curhunk, cache)?; // error[E0499]: cannot borrow `*self` as mutable more than once at a time
                     read_hunk(
                         &mut self.io,
+                        &mut self.stat,
                         &mut *self.map,
                         &mut self.decompress,
                         &mut self.parent,
@@ -917,6 +1014,8 @@ impl<T: R> Read for Chd<T> {
             }
         }
         self.pos += result as i64;
+        self.stat.chd.bytes += result as u64;
+        self.stat.chd.iops += 1;
         Ok(result)
     }
 }
@@ -1004,7 +1103,8 @@ mod tests {
             let end = *offset + *length;
             let original = &image[*offset..end];
             let mut sample = vec![0; *length];
-            chd.read_at(*offset as u64, &mut sample).unwrap();
+            chd.seek(SeekFrom::Start(*offset as u64)).unwrap();
+            chd.read_exact(&mut sample).unwrap();
             assert_eq!(sample, original);
             // check read updates pos
             assert_eq!(chd.seek(SeekFrom::Current(0)).unwrap(), end as u64);
@@ -1112,7 +1212,8 @@ mod tests {
         assert!(chd.validate().is_err());
         let image = include_bytes!("../samples/child.b64");
         let mut sample = vec![0; image.len()];
-        chd.read_at(0, &mut sample).unwrap();
+        chd.seek(SeekFrom::Start(0)).unwrap();
+        chd.read_exact(&mut sample).unwrap();
         assert_eq!(sample, image);
     }
 
